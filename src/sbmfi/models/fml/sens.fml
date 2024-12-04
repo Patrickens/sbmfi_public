@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?><fluxml xmlns="http://www.13cflux.net/fluxml" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.13cflux.net/fluxml http://www.13cflux.net/fluxml">
+<info>
+    <version>1.1</version>
+    <comment>KN: Spirallus-Example With MS measurements</comment>
+</info>
+<reactionnetwork>
+    <metabolitepools>
+      <pool atoms="1" id="A"/>
+      <pool atoms="1" id="B"/>
+      <pool atoms="1" id="C"/>
+      <pool atoms="2" id="D"/>
+    </metabolitepools>
+    <reaction bidirectional="false" id="v1">
+      <reduct   cfg="a" id="A"/>
+      <rproduct cfg="a" id="C"/>
+    </reaction>
+    <reaction bidirectional="false" id="v2">
+      <reduct   cfg="a" id="B"/>
+      <rproduct cfg="a" id="C"/>
+    </reaction>
+    <reaction bidirectional="false" id="v3">
+      <reduct   cfg="a" id="A"/>
+      <reduct   cfg="b" id="A"/>
+      <rproduct cfg="ab" id="D"/>
+    </reaction>
+    <reaction bidirectional="false" id="v4">
+      <reduct   cfg="a" id="A"/>
+      <reduct   cfg="b" id="B"/>
+      <rproduct cfg="ab" id="D"/>
+    </reaction>
+    <reaction id="c_out">
+       <reduct   cfg="a" id="C"/>
+    </reaction>
+    <reaction id="d_out">
+       <reduct   cfg="ab" id="D"/>
+    </reaction>
+  </reactionnetwork>
+<constraints>
+  <net>
+    <textual>
+  		v1&lt;= 10.0;
+  		v1&gt;= 0.0;
+
+  		v2&lt;= 10.0;
+        v2&gt;= 0.0;
+
+  		v3&lt;= 10.0;
+        v3&gt;= 0.0;
+
+  		v4&lt;= 10.0;
+        v4&gt;= 0.0;
+
+  		c_out&lt;= 10.0;
+  		c_out&gt;= 0.0;
+
+  		d_out&lt;= 10.0;
+  		d_out&gt;= 0.0;
+  	</textual>
+  </net>
+</constraints>
+<configuration name="default" stationary="true">
+	<input pool="A" type="isotopomer">
+		<label cfg="1">1.0</label>
+	</input>
+    <input pool="B" type="isotopomer">
+        <label cfg="0">1.0</label>
+    </input>
+  <measurement>
+    <model>
+      <labelingmeasurement>
+        <group id="ms_group_1" scale="auto">
+            <textual>A[1]#M0,1</textual>
+        </group>
+        <group id="ms_group_2" scale="auto">
+            <textual>B[1]#M0,1</textual>
+        </group>
+	    <group id="ms_group_3" scale="auto">
+            <textual>C[1]#M0,1</textual>
+        </group>
+        <group id="ms_group_4" scale="auto">
+            <textual>D[1,2]#M0,1,2</textual>
+        </group>
+      </labelingmeasurement>
+      <fluxmeasurement/>
+    </model>
+    <data>
+        <datum id="ms_group_1" stddev="0.00001" weight="0">.5</datum>
+        <datum id="ms_group_1" stddev="0.00001" weight="1">.25</datum>
+
+        <datum id="ms_group_2" stddev="0.00001" weight="0">.2</datum>
+        <datum id="ms_group_2" stddev="0.00001" weight="1">.2</datum>
+
+        <datum id="ms_group_3" stddev="0.00001" weight="0">.25</datum>
+        <datum id="ms_group_3" stddev="0.00001" weight="1">.25</datum>
+
+        <datum id="ms_group_4" stddev="0.00001" weight="0">.5</datum>
+        <datum id="ms_group_4" stddev="0.00001" weight="1">.25</datum>
+        <datum id="ms_group_4" stddev="0.00001" weight="2">.25</datum>
+    </data>
+  </measurement>
+  <simulation method="emu" type="auto">
+    <variables>
+        <fluxvalue flux="v1" type="net">1.0</fluxvalue>
+        <fluxvalue flux="v4" type="net">1.0</fluxvalue>
+        <fluxvalue flux="v3" type="net">1.0</fluxvalue>
+        <fluxvalue flux="c_out" type="net">2.0</fluxvalue>
+    </variables>
+  </simulation>
+  </configuration>
+</fluxml>

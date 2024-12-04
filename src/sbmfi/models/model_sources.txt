@@ -1,0 +1,14 @@
+SBML:
+e_coli_core2: https://www.nature.com/articles/srep39647#MOESM450
+e_coli_core: http://bigg.ucsd.edu/models/e_coli_core
+iJO1366: http://bigg.ucsd.edu/models/iJO1366
+
+atom transitions:
+Antoniewich_atom_map.docx: https://www.sciencedirect.com/science/article/pii/S1096717615000038#ec0015
+
+fml:
+spiro.fml: https://github.com/modsim/FluxML/blob/master/examples/models/spirallus_model_level_1.fml
+TCAexample_jqmm.fml: https://github.com/JBEI/jqmm/blob/master/data/tests/TCAtoy/13CFLUX2/TCAexample.fml
+
+atom mapping publication braunschweig:
+https://www.biorxiv.org/content/10.1101/2021.10.05.463172v1.full.pdf

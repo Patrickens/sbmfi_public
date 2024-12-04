@@ -1,0 +1,9 @@
+build/
+dist/
+hdf_data/
+measurement_model/
+src/
+!src/sumoflux/models/fml/
+worklists/
+*.*
+LICENCE

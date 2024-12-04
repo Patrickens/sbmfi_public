@@ -1,0 +1,108 @@
+{
+    "Glycolysis": {
+        "v1":	"Gluc.ext (abcdef) + PEP (ghi) --> G6P (abcdef) + Pyr (ghi)",
+        "v2":	"G6P (abcdef) <=> F6P (abcdef)",
+        "v3":	"F6P (abcdef) + ATP --> FBP (abcdef)",
+        "v4":	"FBP (abcdef) <=> DHAP (cba) + GAP (def)",
+        "v5":	"DHAP (abc) <=> GAP (abc)",
+        "v6":	"GAP (abc) <=> 3PG (abc) + ATP + NADH",
+        "v7":	"3PG (abc) <=> PEP (abc)",
+        "v8":	"PEP (abc) --> Pyr (abc) + ATP"
+    },
+    "Pentose Phosphate Pathway": {
+        "v9":	"G6P (abcdef) --> 6PG (abcdef) + NADPH",
+        "v10":	"6PG (abcdef) --> Ru5P (bcdef) + CO2 (a) + NADPH",
+        "v11":	"Ru5P (abcde) <=> X5P (abcde)",
+        "v12":	"Ru5P (abcde) <=> R5P (abcde)",
+        "v13":	"X5P (abcde) <=> TK-C2 (ab) + GAP (cde)",
+        "v14":	"F6P (abcdef) <=> TK-C2 (ab) + E4P (cdef)",
+        "v15":	"S7P (abcdefg) <=> TK-C2 (ab) + R5P (cdefg)",
+        "v16":	"F6P (abcdef) <=> TA-C3 (abc) + GAP (def)",
+        "v17":	"S7P (abcdefg) <=> TA-C3 (abc) + E4P (defg)"
+    },
+    "Entner-Doudoroff Pathway": {
+        "v18":	"6PG (abcdef) --> KDPG (abcdef)",
+        "v19":	"KDPG (abcdef) --> Pyr (abc) + GAP (def)"
+    },
+    "TCA Cycle": {
+        "v20":	"Pyr (abc) --> AcCoA (bc) + CO2 (a) + NADH",
+        "v21":	"OAC (abcd) + AcCoA (ef) --> Cit (dcbfea)",
+        "v22":	"Cit (abcdef) <=> ICit (abcdef)",
+        "v23":	"ICit (abcdef) <=> AKG (abcde) + CO2 (f) + NADPH",
+        "v24":	"AKG (abcde) --> SucCoA (bcde) + CO2 (a) + NADH",
+        "v25":	"SucCoA (abcd) <=> Suc (0.5 abcd + 0.5 dcba) + ATP",
+        "v26":	"Suc (0.5 abcd + 0.5 dcba) <=> Fum (0.5 abcd + 0.5 dcba) + FADH2",
+        "v27":	"Fum (0.5 abcd + 0.5 dcba) <=> Mal (abcd)",
+        "v28":	"Mal (abcd) <=> OAC (abcd) + NADH"
+    },
+    "Glyoxylate Shunt": {
+        "v29":	"ICit (abcdef) <=> Glyox (ab) + Suc (0.5 edcf + 0.5 fcde)",
+        "v30":	"Glyox (ab) + AcCoA (cd) --> Mal (abdc)"
+    },
+    "Amphibolic Reactions": {
+        "v31":	"Mal (abcd) --> Pyr (abc) + CO2 (d) + NADPH",
+        "v32":	"Mal (abcd) --> Pyr (abc) + CO2 (d) + NADH",
+        "v33":	"PEP (abc) + CO2 (d) --> OAC (abcd)",
+        "v34":	"OAC (abcd) + ATP --> PEP (abc) + CO2 (d)"
+    },
+    "Acetic Acid Formation": {
+        "v35":	"AcCoA (ab) <=> Ac (ab) + ATP"
+    },
+    "Amino Acid Biosynthesis": {
+        "v36":	"AKG (abcde) + NADPH + NH3 --> Glu (abcde)",
+        "v37":	"Glu (abcde) + ATP + NH3 --> Gln (abcde)",
+        "v38":	"Glu (abcde) + ATP + 2 NADPH --> Pro (abcde)",
+        "v39":	"Glu (abcde) + CO2 (f) + Gln (ghijk) + Asp (lmno) + AcCoA (pq) + 5 ATP + NADPH --> Arg (abcdef) + AKG (ghijk) + Fum (lmno) + Ac (pq)",
+        "v40":	"OAC (abcd) + Glu (efghi) --> Asp (abcd) + AKG (efghi)",
+        "v41":	"Asp (abcd) + 2 ATP + NH3 --> Asn (abcd)",
+        "v42":	"Pyr (abc) + Glu (defgh) --> Ala (abc) + AKG (defgh)",
+        "v43":	"3PG (abc) + Glu (defgh) --> Ser (abc) + AKG (defgh) + NADH",
+        "v44":	"Ser (abc) <=> Gly (ab) + MEETHF (c)",
+        "v45":	"Gly (ab) <=> CO2 (a) + MEETHF (b) + NADH + NH3",
+        "v46":	"Thr (abcd) --> Gly (ab) + AcCoA (cd) + NADH",
+        "v47":	"Ser (abc) + AcCoA (de) + 3 ATP + 4 NADPH + SO4 --> Cys (abc) + Ac (de)",
+        "v48":	"Asp (abcd) + Pyr (efg) + Glu (hijkl) + SucCoA (mnop) + ATP + 2 NADPH --> LL-DAP (0.5 abcdgfe + 0.5 efgdcba) + AKG (hijkl) + Suc (0.5 mnop + 0.5 ponm)",
+        "v49":	"LL-DAP (0.5 abcdefg + 0.5 gfedcba) --> Lys (abcdef) + CO2 (g)",
+        "v50":	"Asp (abcd) + 2 ATP + 2 NADPH --> Thr (abcd)",
+        "v51":	"Asp (abcd) + METHF (e) + Cys (fgh) + SucCoA (ijkl) + ATP + 2 NADPH --> Met (abcde) + Pyr (fgh) + Suc (0.5 ijkl + 0.5 lkji) + NH3",
+        "v52":	"Pyr (abc) + Pyr (def) + Glu (ghijk) + NADPH --> Val (abcef) + CO2 (d) + AKG (ghijk)",
+        "v53":	"AcCoA (ab) + Pyr (cde) + Pyr (fgh) + Glu (ijklm) + NADPH --> Leu (abdghe) + CO2 (c) + CO2 (f) + AKG (ijklm) + NADH",
+        "v54":	"Thr (abcd) + Pyr (efg) + Glu (hijkl) + NADPH --> Ile (abfcdg) + CO2 (e) + AKG (hijkl) + NH3",
+        "v55":	"PEP (abc) + PEP (def) + E4P (ghij) + Glu (klmno) + ATP + NADPH --> Phe (abcefghij) + CO2 (d) + AKG (klmno)",
+        "v56":	"PEP (abc) + PEP (def) + E4P (ghij) + Glu (klmno) + ATP + NADPH --> Tyr (abcefghij) + CO2 (d) + AKG (klmno) + NADH",
+        "v57":	"Ser (abc) + R5P (defgh) + PEP (ijk) + E4P (lmno) + PEP (pqr) + Gln (stuvw) + 3 ATP + NADPH --> Trp (abcedklmnoj) + CO2 (i) + GAP (fgh) + Pyr (pqr) + Glu (stuvw)",
+        "v58":	"R5P (abcde) + FTHF (f) + Gln (ghijk) + Asp (lmno) + 5 ATP --> His (edcbaf) + AKG (ghijk) + Fum (lmno) + 2 NADH"
+    },
+    "One-Carbon Metabolism": {
+        "v59":	"MEETHF (a) + NADH --> METHF (a)",
+        "v60":	"MEETHF (a) --> FTHF (a) + NADPH"
+    },
+    "Oxidative Phosphorylation": {
+        "v61":	"NADH + 0.5 O2 --> 2 ATP",
+        "v62":	"FADH2 + 0.5 O2 --> 1 ATP"
+    },
+    "Transhydrogenation": {
+        "v63":	"NADH <=> NADPH"
+    },
+    "ATP Hydrolysis": {
+        "v64":	"ATP --> ATP:ext"
+    },
+    "Transport": {
+        "v65":	"Ac (ab) --> Ac.ext (ab)",
+        "v66":	"CO2 (a) --> CO2.ext (a)",
+        "v67":	"O2.ext --> O2",
+        "v68":	"NH3.ext --> NH3",
+        "v69":	"SO4.ext --> SO4"
+    },
+    "Biomass Formation": {
+        "v70":	"0.488 Ala + 0.281 Arg + 0.229 Asn + 0.229 Asp + 0.087 Cys + 0.250 Glu + 0.250 Gln + 0.582 Gly + 0.090 His + 0.276 Ile + 0.428 Leu + 0.326 Lys + 0.146 Met + 0.176 Phe + 0.210 Pro + 0.205 Ser + 0.241 Thr + 0.054 Trp + 0.131 Tyr + 0.402 Val + 0.205 G6P + 0.071 F6P + 0.754 R5P + 0.129 GAP + 0.619 3PG + 0.051 PEP + 0.083 Pyr + 2.510 AcCoA + 0.087 AKG + 0.340 OAC + 0.443 MEETHF + 33.247 ATP + 5.363 NADPH --> 39.68 Biomass + 1.455 NADH"
+    },
+    "CO2 Exchange": {
+        "v71":	"CO2.unlabeled (a) + CO2 (b) --> CO2 (a) + CO2.out (b)"
+    },
+    "MODEL SOURCE": {
+        "publication":	"Integrated 13C-metabolic flux analysis of 14 parallel labeling experiments in Escherichia coli",
+        "website":	"https://www.sciencedirect.com/science/article/pii/S1096717615000038#ec0015",
+        "file":	"1-s2.0-S1096717615000038-mmc3.docx"
+    }
+}
