@@ -5,7 +5,7 @@ import math
 import numpy as np
 import pandas as pd
 import multiprocessing as mp
-from typing import Iterable, Union, Dict, Tuple
+from typing import Union, Dict
 import tqdm
 from sbmfi.core.model import LabellingModel
 from sbmfi.core.simulfuncs import (
@@ -17,11 +17,13 @@ from sbmfi.core.observation import (
     BoundaryObservationModel,
     MDV_ObservationModel,
 )
+from sbmfi.core.coordinater import make_theta_polytope
 from sbmfi.core.util import (
     hdf_opener_and_closer,
     make_multidex,
-    profile,
+    profile
 )
+
 
 
 warnings.simplefilter('ignore', pt.NaturalNameWarning)
@@ -38,10 +40,7 @@ https://bayesiancomputationbook.com/markdown/chp_08.html
 https://michael-franke.github.io/intro-data-analysis/bayesian-p-values-model-checking.html
 """
 
-# from line_profiler import line_profiler
-# import arviz as az
-# import tqdm
-# prof2 = line_profiler.LineProfiler()
+
 class _BaseSimulator(object):
     def __init__(
             self,
@@ -61,7 +60,7 @@ class _BaseSimulator(object):
         has_log_prob = []
         i, j = 0, 0
         for k, (labelling_id, obmod) in enumerate(mdv_observation_models.items()):
-            model.set_input_labelling(substrate_df.loc[labelling_id])  # NB check whether valid susbtrate_df
+            model.set_substrate_labelling(substrate_df.loc[labelling_id])  # NB check whether valid susbtrate_df
             if not model.state_id.equals(obmod.state_id):
                 raise ValueError
             if not model._la == obmod._la:
@@ -94,7 +93,8 @@ class _BaseSimulator(object):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        self._model.build_simulator(**self._model._fcm_kwargs)
+        model = state.get('_model')
+        self._model.build_model(free_reaction_id=model._free_reaction_id)
 
     @property
     def data_id(self):
@@ -106,10 +106,6 @@ class _BaseSimulator(object):
                 did.extend(self._bom.boundary_id.tolist())
             self._did = pd.MultiIndex.from_tuples(did, names=['labelling_id', 'data_id'])
         return self._did.copy()
-
-    @property
-    def theta_id(self):
-        return self._fcm.theta_id
 
     def _pandalize_data(self, data, index, n_obs, return_mdvs=False):
         if return_mdvs:
@@ -130,45 +126,42 @@ class _BaseSimulator(object):
 
     def simulate(
             self,
-            theta=None,
+            labelling_fluxes=None,
             n_obs=3,
             return_mdvs=False, # whether to return mdvs, observation_average or noisy observations
             pandalize=False,
             mdvs=None,
     ):
         index = None
-        if isinstance(theta, pd.DataFrame):
-            index = theta.index
-            theta = self._la.get_tensor(values=theta.loc[:, self.theta_id].values)
+        if isinstance(labelling_fluxes, pd.DataFrame):
+            index = labelling_fluxes.index
+            labelling_fluxes = self._la.get_tensor(values=labelling_fluxes.loc[:, self._fcm.fluxes_id].values)
 
-        vape = theta.shape
-        if len(vape) > 2:
-            theta = self._la.view(theta, shape=(math.prod(vape[:-1]), vape[-1]))
-
-        fluxes = self._fcm.map_theta_2_fluxes(theta)
+        if len(labelling_fluxes.shape) > 2:
+            raise ValueError(f'only handles (n_samples x n_fluxes) data, got {labelling_fluxes.shape}')
 
         if mdvs is None:
-            if len(fluxes.shape) > 2:
+            if len(labelling_fluxes.shape) > 2:
                 raise ValueError('pass n_samples x n_fluxes array!')
-            n_f = fluxes.shape[0]
-            self._model.set_fluxes(fluxes, index, trim=True)  # this is where wrongly shaped fluxes are caught!
-            fluxes = self._model._fluxes
+            n_f = labelling_fluxes.shape[0]
+            self._model.set_fluxes(labelling_fluxes, index, trim=True)  # this is where wrongly shaped fluxes are caught!
+            labelling_fluxes = self._model._fluxes
         elif return_mdvs:
             raise ValueError('return passed MDVS?')
         else:  # this is for when we pass theta and mdvs and the model batch_size does not match the shape of fluxes
-            fluxes = self._fcm.frame_fluxes(fluxes, index, trim=True)
+            labelling_fluxes = self._fcm.frame_fluxes(labelling_fluxes, index, trim=True)
             n_f = mdvs.shape[0]
 
         slicer = 0 if n_obs == 0 else slice(None)
         n_obshape = max(1, n_obs)
 
         if return_mdvs:
-            result = self._la.get_tensor(shape=(n_f, len(self._obmods), self._model._ns))
+            result = self._la.get_tensor(shape=(n_f, len(self._obmods), int(self._model._s.shape[-1])))
         else:
             result = self._la.get_tensor(shape=(n_f, n_obshape, len(self.data_id)))
             if self._bomsize > 0:
                 result[:, slicer, -self._bomsize:] = self._bom.sample_observation(
-                    fluxes[:, self._bo_idx], n_obs=n_obs
+                    labelling_fluxes[:, self._bo_idx], n_obs=n_obs
                 )
 
         for i, (labelling_id, obmod) in enumerate(self._obmods.items()):
@@ -176,7 +169,7 @@ class _BaseSimulator(object):
             if mdvs is not None:
                 mdv = mdvs[:, i, :]
             else:
-                self._model.set_input_labelling(input_labelling=self._substrate_df.loc[labelling_id])
+                self._model.set_substrate_labelling(substrate_labelling=self._substrate_df.loc[labelling_id])
                 mdv = self._model.cascade()
             if return_mdvs:
                 result[:, i, :] = mdv
@@ -227,7 +220,6 @@ class _BaseSimulator(object):
             'fluxes': self._fcm.fluxes_id,
             'mdv': self._model.state_id,
             'data': self.data_id,
-            'theta': self.theta_id,
         }.items():
             if what == 'data':
                 what_id = pd.MultiIndex.from_frame(pd.read_hdf(hdf.filename, key='data_id', mode=hdf.mode))
@@ -250,7 +242,6 @@ class _BaseSimulator(object):
             # this signals that the hdf has been freshly created
             self._substrate_df.to_hdf(hdf.filename, key='substrate_df', mode=hdf.mode, format='table')
             pt.Array(hdf.root, name='mdv_id', obj=self._model.state_id.values.astype(str))
-            pt.Array(hdf.root, name='theta_id', obj=self.theta_id.values.astype(str))
             pt.Array(hdf.root, name='fluxes_id', obj=self._model._fcm.fluxes_id.values.astype(str))  # NB these are the untrimmed fluxes
             self.data_id.to_frame(index=False).to_hdf(hdf.filename, key='data_id', mode=hdf.mode, format='table')
         else:
@@ -324,7 +315,7 @@ class _BaseSimulator(object):
 
         samples_id = pd.RangeIndex(start, stop, step, name='samples_id')
 
-        if what in ('fluxes', 'theta'):
+        if what == 'fluxes':
             xcs_id = pd.Index(hdf.root[f'{what}_id'].read().astype(str), name=f'{what}_id')
             return pd.DataFrame(xcsarr, index=samples_id, columns=xcs_id)
 
@@ -343,9 +334,9 @@ class _BaseSimulator(object):
                 for i in range(len(labelling_id))], axis=1, keys=labelling_id
             )
 
-    def __call__(self, theta, n_obs=3, pandalize=False, **kwargs):
-        vape = theta.shape
-        data = self.simulate(theta, n_obs, return_mdvs=False, pandalize=pandalize)
+    def __call__(self, labelling_fluxes, n_obs=3, pandalize=False, **kwargs):
+        vape = labelling_fluxes.shape
+        data = self.simulate(labelling_fluxes, n_obs, return_mdvs=False, pandalize=pandalize)
         if pandalize:
             return data
         n_obshape = max(1, n_obs)
@@ -360,31 +351,31 @@ class DataSetSim(_BaseSimulator):
             mdv_observation_models: Dict[str, MDV_ObservationModel],
             boundary_observation_model: BoundaryObservationModel = None,
             num_processes=0,
-            epsilon=1e-12,
     ):
         super(DataSetSim, self).__init__(model, substrate_df, mdv_observation_models, boundary_observation_model)
-        self._eps = epsilon
+
         if num_processes < 0:
             num_processes = psutil.cpu_count(logical=False)
         self._num_processes = num_processes
+
         self._mp_pool = None
         if num_processes > 0:
-            self._mp_pool = self._get_mp_pool()
+            self._mp_pool = mp.Pool(
+                processes=self._num_processes, initializer=init_observer,
+                initargs=(self._model, self._obmods)
+            )
 
     def __getstate__(self):
         if self._mp_pool is not None:
-            self._mp_pool.close()
+            self._mp_pool.terminate()
             self._mp_pool.join()
         self._mp_pool = None
         return self.__dict__.copy()
 
-    def _get_mp_pool(self):
-        if (self._mp_pool is None) or (hasattr(self._mp_pool, '_state') and (self._mp_pool._state == 'CLOSE')):
-            self._mp_pool = mp.Pool(
-                processes=self._num_processes, initializer=init_observer,
-                initargs=(self._model, self._obmods, self._eps)
-            )
-        return self._mp_pool
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self._num_processes > 0:
+            self._mp_pool = mp.Pool(self._num_processes)
 
     def _fill_results(self, result, worker_result):
         input_labelling = worker_result['input_labelling']
@@ -408,64 +399,55 @@ class DataSetSim(_BaseSimulator):
 
     def simulate_set(
             self,
-            theta,
+            labelling_fluxes,
             n_obs=3,
             fluxes_per_task=None,
             what='data',
             break_i=-1,
-            close_pool=True,
             show_progress=False,
-            save_fluxes=False,
     ) -> {}:
 
-        if isinstance(theta, pd.DataFrame):
-            theta = self._la.get_tensor(values=theta.loc[:, self.theta_id].values)
+        if isinstance(labelling_fluxes, pd.DataFrame):
+            labelling_fluxes = self._la.get_tensor(values=labelling_fluxes.loc[:, self._fcm.fluxes_id].values)
 
-        vape = theta.shape
-        if len(vape) > 2:
-            theta = self._la.view(theta, shape=(math.prod(vape[:-1]), vape[-1]))
-
-        fluxes = self._fcm.map_theta_2_fluxes(theta)
-        if fluxes.shape[0] <= self._la._batch_size:
-            raise ValueError('impossible')
+        if labelling_fluxes.ndim > 2:
+            raise ValueError(f'only handles (n_samples x n_fluxes) data, got {labelling_fluxes.shape}')
 
         result = {}
-        if save_fluxes:
-            result['fluxes'] = fluxes
-        result['validx'] = self._la.get_tensor(shape=(fluxes.shape[0], len(self._obmods)), dtype=np.bool_)
-        result['theta'] = theta  # save stratified theta!!
+        result['validx'] = self._la.get_tensor(shape=(labelling_fluxes.shape[0], len(self._obmods)), dtype=np.bool_)
+        result['fluxes'] = labelling_fluxes
 
-        fluxes = self._model._fcm.frame_fluxes(fluxes, trim=True)
+        labelling_fluxes = self._model._fcm.frame_fluxes(labelling_fluxes, trim=True)
 
         if what not in ('all', 'data', 'mdv'):
             raise ValueError('not sure what to simulate')
-        if fluxes.shape[0] < self._la._batch_size:
+        if labelling_fluxes.shape[0] < self._la._batch_size:
             raise ValueError(f'n must be at least batch size: {self._la._batch_size}')
 
         if what != 'data':
-            result['mdv'] = self._la.get_tensor(shape=(fluxes.shape[0], len(self._obmods), len(self._model.state_id)))
+            result['mdv'] = self._la.get_tensor(shape=(labelling_fluxes.shape[0], len(self._obmods), len(self._model.state_id)))
         if what != 'mdv':
             n_obshape = max(1, n_obs)
-            result['data'] = self._la.get_tensor(shape=(fluxes.shape[0], n_obshape, len(self.data_id)))
+            result['data'] = self._la.get_tensor(shape=(labelling_fluxes.shape[0], n_obshape, len(self.data_id)))
 
         if (self._bomsize > 0) and (what != 'mdv'):
             slicer = 0 if n_obs == 0 else slice(None)
-            bo_fluxes = fluxes[:, self._bo_idx]
+            bo_fluxes = labelling_fluxes[:, self._bo_idx]
             result['data'][:, slicer, -self._bomsize:] = self._bom(bo_fluxes, n_obs=n_obs)
 
         if fluxes_per_task is None:
-            fluxes_per_task = math.ceil(fluxes.shape[0] / max(self._num_processes, 1))
+            fluxes_per_task = math.ceil(labelling_fluxes.shape[0] / max(self._num_processes, 1))
 
-        fluxes_per_task = min(fluxes.shape[0], fluxes_per_task)
+        fluxes_per_task = min(labelling_fluxes.shape[0], fluxes_per_task)
 
         tasks = observator_tasks(
-            fluxes, substrate_df=self._substrate_df, fluxes_per_task=fluxes_per_task, n_obs=n_obs, what=what
+            labelling_fluxes, substrate_df=self._substrate_df, fluxes_per_task=fluxes_per_task, n_obs=n_obs, what=what
         )
         if show_progress:
-            pbar = tqdm.tqdm(total=fluxes.shape[0] * self._substrate_df.shape[0], ncols=100)
+            pbar = tqdm.tqdm(total=labelling_fluxes.shape[0] * self._substrate_df.shape[0], ncols=100)
 
         if self._num_processes == 0:
-            init_observer(self._model, self._obmods, self._eps)
+            init_observer(self._model, self._obmods)
             for i, task in enumerate(tasks):
                 worker_result = obervervator_worker(task)
                 self._fill_results(result, worker_result)
@@ -476,36 +458,30 @@ class DataSetSim(_BaseSimulator):
                 if (break_i > -1) and (i > break_i):
                     break
         else:
-            mp_pool = self._get_mp_pool()
-            for worker_result in mp_pool.imap_unordered(obervervator_worker, iterable=tasks):
+            for worker_result in self._mp_pool.imap_unordered(obervervator_worker, iterable=tasks):
                 self._fill_results(result, worker_result)
                 if show_progress:
                     i, j = worker_result['start_stop']
                     pbar.update(n = j - i)
-            if close_pool:
-                mp_pool.close()
-                mp_pool.join()
         if show_progress:
             pbar.close()
             result['running_time'] = pbar.format_dict['elapsed']
         return result
 
     def __call__(
-            self, theta, n_obs=5, fluxes_per_task=None, close_pool=False, show_progress=False, pandalize=False,
+            self, labelling_fluxes, n_obs=5, fluxes_per_task=None, close_pool=False, show_progress=False, pandalize=False,
             return_time=False, **kwargs
     ):
         index = None
-        if isinstance(theta, pd.DataFrame):
-            index = theta.index
+        if isinstance(labelling_fluxes, pd.DataFrame):
+            index = labelling_fluxes.index
 
-        vape = theta.shape
+        vape = labelling_fluxes.shape
         result = self.simulate_set(
-            theta, n_obs,
+            labelling_fluxes, n_obs,
             fluxes_per_task=fluxes_per_task,
             what='data',
-            close_pool=close_pool,
             show_progress=show_progress,
-            save_fluxes=False,
         )
 
         data = result['data']
@@ -521,11 +497,7 @@ class DataSetSim(_BaseSimulator):
 
 if __name__ == "__main__":
     from sbmfi.models.small_models import spiro
-    from sbmfi.inference.priors import UniNetFluxPrior
-    from sbmfi.inference.complotting import SMC_PLOT
-    from sbmfi.inference.bayesian import SMC
-    from sbmfi.models.build_models import build_e_coli_anton_glc, _bmid_ANTON
-    import pickle
+    from sbmfi.priors.uniform import UniformRoundedFleXchPrior
 
     pd.set_option('display.max_rows', 500)
     pd.set_option('display.max_columns', 500)
@@ -536,24 +508,24 @@ if __name__ == "__main__":
         which_labellings=['A', 'B']
 
     )
-    up = UniNetFluxPrior(model.flux_coordinate_mapper, cache_size=20)
+    up = UniformRoundedFleXchPrior(model.flux_coordinate_mapper)
     dss = DataSetSim(
         model=model,
         substrate_df=kwargs['substrate_df'],
         mdv_observation_models=kwargs['basebayes']._obmods,
         boundary_observation_model=kwargs['basebayes']._bom,
-        num_processes=1,
+        num_processes=2,
     )
 
-    samples = up.sample((50,))
+    samples = up.sample((1000,))
+    labelling_fluxes = model.flux_coordinate_mapper.map_theta_2_fluxes(samples, rescale_val=None)
 
     result = dss.simulate_set(
-        theta=samples,
+        labelling_fluxes=labelling_fluxes,
         n_obs=2,
         show_progress=True,
-        close_pool=False,
     )
-    print(result['theta'].shape)
+    print(result.keys())
 
 
     # smc_tomek = "C:\python_projects\sbmfi\SMC_e_coli_glc_tomek_obsmod_copy_NEW.nc"

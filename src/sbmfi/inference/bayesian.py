@@ -1,7 +1,11 @@
+import torch.distributions
+import psutil
+import multiprocessing as mp
 from sbmfi.core.simulator import _BaseSimulator, DataSetSim
-from sbmfi.inference.priors import _BasePrior, _NetFluxPrior
+from sbmfi.priors.uniform import _BasePrior, BaseRoundedPrior
 from sbmfi.core.observation import MDV_ObservationModel, BoundaryObservationModel
 from sbmfi.core.model import LabellingModel
+from sbmfi.core.simulfuncs import init_observer
 import math
 import arviz as az
 import numpy as np
@@ -9,10 +13,7 @@ import pandas as pd
 import tqdm
 from typing import Dict
 from functools import partial
-from sbmfi.core.util import profile
 from sbi.inference.posteriors.base_posterior import NeuralPosterior
-import time
-from line_profiler import line_profiler
 import xarray as xr
 
 # from line_profiler import line_profiler
@@ -20,6 +21,8 @@ import xarray as xr
 # from sbmfi.core.util import profile
 
 # profile2 = line_profiler.LineProfiler()
+
+
 class _BaseBayes(_BaseSimulator):
 
     def __init__(
@@ -27,7 +30,7 @@ class _BaseBayes(_BaseSimulator):
             model: LabellingModel,
             substrate_df: pd.DataFrame,
             mdv_observation_models: Dict[str, MDV_ObservationModel],
-            prior: _NetFluxPrior,
+            prior: BaseRoundedPrior,
             boundary_observation_model: BoundaryObservationModel = None,
     ):
         super(_BaseBayes, self).__init__(model, substrate_df, mdv_observation_models, boundary_observation_model)
@@ -36,8 +39,6 @@ class _BaseBayes(_BaseSimulator):
         if prior is not None:
             if not prior._fcm.labelling_fluxes_id.equals(model.labelling_fluxes_id):
                 raise ValueError('prior has different labelling fluxes than model')
-            if not model._fcm.theta_id.equals(prior.theta_id):
-                raise ValueError('theta of model and prior are different')
 
         self._sampler = self._fcm._sampler
         self._K = self._sampler.dimensionality
@@ -57,6 +58,10 @@ class _BaseBayes(_BaseSimulator):
     def potentype(self):
         if self._potentype is not None:
             return self._potentype[:]
+
+    @property
+    def theta_id(self):  # any basebayes subclass has the following theta_id
+        return self._fcm.theta_id(coordinate_id='rounded')
 
     @property
     def measurements(self):
@@ -96,14 +101,21 @@ class _BaseBayes(_BaseSimulator):
             if theta.shape[0] > 1:
                 raise ValueError
             theta = theta.iloc[0]
-        self._true_theta = self._la.atleast_2d(self._la.get_tensor(values=theta.loc[self.theta_id].values))
+        true_theta = self._la.atleast_2d(self._la.get_tensor(values=theta.loc[self.theta_id].values))
+        prior_support = self._prior.support
+        prior_support.to(true_theta.device)
+        within_bounds = prior_support.check(true_theta)
+        if not within_bounds.all():
+            raise ValueError('the passed true theta is not within the polytope ')
+        self._true_theta = true_theta
         self._true_theta_id = theta.name
 
     def simulate_true_data(self, n_obs=0, pandalize=True):
         if self._true_theta is None:
             raise ValueError('set true_theta')
         tt = self._la.tile(self._true_theta.T, (self._la._batch_size, )).T
-        true_data = self.simulate(tt, n_obs, pandalize=pandalize)
+        true_labelling_fluxes = self._fcm.map_theta_2_fluxes(tt, return_thermo=False)
+        true_data = self.simulate(true_labelling_fluxes, n_obs, pandalize=pandalize)
         if not pandalize:
             return true_data[[0]]
         true_data = true_data.iloc[[0]]
@@ -124,7 +136,11 @@ class _BaseBayes(_BaseSimulator):
         if self._x_meas is None:
             raise ValueError('set measurement')
 
-        mu_o = self.simulate(theta, n_obs=0)
+        vape = theta.shape
+        if len(vape) > 2:
+            theta = self._la.view(theta, shape=(math.prod(vape[:-1]), vape[-1]))
+        labelling_fluxes = self._fcm.map_theta_2_fluxes(theta)
+        mu_o = self.simulate(labelling_fluxes, n_obs=0)
 
         n_f = self._model._fluxes.shape[0]
         n_meas = self._x_meas.shape[0]
@@ -134,7 +150,7 @@ class _BaseBayes(_BaseSimulator):
 
         # FUCKING AROOND
         # difff = self._la.get_tensor(shape=(n_f, n_meas, len(self._obmods) + n_bom))
-        truedist = ((theta - self._true_theta) ** 2).mean(1)
+        # truedist = ((theta - self._true_theta) ** 2).mean(1)
 
         if self._bomsize > 0:
             bo_meas = self._x_meas[:, -self._bomsize:]
@@ -162,10 +178,6 @@ class _BaseBayes(_BaseSimulator):
 
         if sum:
             log_lik = self._la.sum(log_lik, axis=(1, 2), keepdims=False)
-
-        # print(truedist)
-        # print(self._la.sum(log_lik, axis=(1, 2), keepdims=False))
-        # print()
 
         if return_data:
             return log_lik, mu_o
@@ -224,7 +236,8 @@ class _BaseBayes(_BaseSimulator):
         vape = theta.shape
         if len(vape) > 2:
             theta = self._la.view(theta, shape=(math.prod(vape[:-1]), vape[-1]))
-        data = self.__call__(theta, n_obs=n_obs, **kwargs)
+        labelling_fluxes = self._fcm.map_theta_2_fluxes(theta)
+        data = self.__call__(labelling_fluxes, n_obs=n_obs, **kwargs)
 
         time = None
         if isinstance(data, tuple):
@@ -359,75 +372,6 @@ class _BaseBayes(_BaseSimulator):
         }
         return dims, coords
 
-    def simulate_data(
-            self,
-            inference_data: az.InferenceData = None,
-            n=20000,
-            theta=None,
-            include_predictive=True,
-            num_processes=0,
-            n_obs=0,
-            show_progress=True,
-    ):
-        model = self._model
-
-        from_prior = theta is None
-        if from_prior:
-            theta = self._prior.sample(sample_shape=(n,))
-            if model._la.backend != 'torch':
-                # TODO inconsistency between model and prior LinAlg, where prior has torch backend and model has numpy backend
-                theta = self._prior._fcm._la.tonp(theta)
-
-        if (inference_data is None) or not from_prior:
-            result = dict(theta=theta[None, :, :])
-        else:
-            prior_dataset = az.convert_to_dataset(
-                {'theta': theta[None, :, :]},
-                dims={'theta': ['theta_id']},
-                coords={'theta_id': model._fcm.theta_id.tolist()},
-            )
-            inference_data.add_groups(
-                group_dict={'prior': prior_dataset},
-            )
-
-        if include_predictive:
-            if not hasattr(self, '_dss'):
-                dsim = DataSetSim(
-                    model=model,
-                    substrate_df=self._substrate_df,
-                    mdv_observation_models=self._obmods,
-                    boundary_observation_model=self._bom,
-                    num_processes=num_processes,
-                )
-            else:
-                dsim = self._dss
-            data = dsim.simulate_set(theta, n_obs=n_obs, show_progress=show_progress)['data']
-            dims = {'data': ['data_id']}
-            coords = {'data_id': [f'{i[0]}: {i[1]}' for i in self.data_id.tolist()]}
-            if n_obs == 0:
-                data = model._la.transax(data, 0, 1)
-            else:
-                dims['data'] = ['obs_idx', 'data_id']
-                data = data[None, :, :, :]
-
-            if (inference_data is None) or not from_prior:
-                result['data'] = data
-            else:
-                prior_dataset = az.convert_to_dataset(
-                    {'data': data},
-                    dims=dims,
-                    coords=coords,
-                )
-                inference_data.add_groups(
-                    group_dict={'prior_predictive': prior_dataset},
-                )
-
-        if (inference_data is None) or not from_prior:
-            if inference_data is not None:
-                print(
-                    'returning result instead of adding to inference data, since it is not clear where theta originates')
-            return result
-
     def perturb_particles(
             self,
             theta,
@@ -452,7 +396,7 @@ class _BaseBayes(_BaseSimulator):
             # TODO: https://link.springer.com/article/10.1007/BF02591694
             #  implement coordinate hit-and-run (might be faster??)
             # uniform samples from unit ball in batch_shape dims
-            self._sphere_samples = self._la.sample_hypersphere(shape=(*batch_shape, self._K))
+            self._sphere_samples = self._la.sample_unit_hyper_sphere_ball(shape=(*batch_shape, self._K))
             # batch compute distances to all planes
             self._A_dist = self._la.tensormul_T(self._sampler._G, self._sphere_samples)
 
@@ -464,7 +408,7 @@ class _BaseBayes(_BaseSimulator):
         allpha = pol_dist / A_dist
         alpha_min, alpha_max = self._la.min_pos_max_neg(allpha, return_what=0)
 
-        if chord_std.ndim > 1:
+        if not isinstance(chord_std, float) and chord_std.ndim > 1:
             # this means that we passed a covariance matrix and we need to compute std along the line
             chord_std = self._la.sqrt(self._la.sum(((sphere_sample @ chord_std) * sphere_sample), -1))
 
@@ -520,13 +464,13 @@ class _BaseBayes(_BaseSimulator):
         directions = directions / self._la.norm(directions, 2, -1, True)
 
         A_dist = self._la.tensormul_T(self._sampler._G, directions)  # this one has wrong sign on first row
-        particle_pol_dist = self._sampler._h.T - self._la.tensormul_T(self._sampler._G, old_pol)
-
+        particle_pol_dist = self._la.unsqueeze(self._sampler._h.T - self._la.tensormul_T(self._sampler._G, old_pol), 1)
         allpha = -particle_pol_dist / A_dist
         alpha_min, alpha_max = self._la.min_pos_max_neg(allpha, return_what=0)
+
         alpha = diff[..., 0] / directions[..., 0]  # alpha is the same for all dimensions, so we only need to select 1
 
-        mu = self._la.zeros(alpha.shape)
+        mu = self._la.zeros(alpha.shape)  # TODO: could we just pass 0.0??
 
         if chord_std.ndim > 1:
             # this means that we passed a covariance matrix and we need to compute std along the line
@@ -536,7 +480,7 @@ class _BaseBayes(_BaseSimulator):
         # print(new_pol)  # check whether we recover newpol from oldpol
 
         log_probs = self._la.bounded_distribution_log_prob(
-            x=alpha, lo=alpha_min, hi=alpha_max, mu=mu, std=chord_std, which=chord_proposal, old_is_new=old_is_new,
+            x=alpha, lo=alpha_min, hi=alpha_max, mu=mu, std=chord_std, which=chord_proposal, old_is_new=False,
             unsqueeze=False,
         )
         if self._nx > 0:
@@ -552,17 +496,188 @@ class _BaseBayes(_BaseSimulator):
             log_probs += self._la.sum(xch_log_probs, -1, keepdims=False)
         return log_probs
 
-    def map_chains_2_theta(self, chains):
-        # if chains are not rounded and not log-ratio, we need to map accordingly
-        if (self._sampler.basis_coordinates == 'rounded') and not self._fcm.logit_xch_fluxes:
-            return chains
-        theta = self._fcm._sampler._map_rounded_2_basis(rounded=chains[..., :self._K])
-        if self._nx > 0:
-            xch_fluxes = chains[..., -self._nx:]
-            if self._fcm.logit_xch_fluxes:
-                xch_fluxes = self._fcm._logit_xch(xch_fluxes)
-            theta = self._la.cat([theta, xch_fluxes], dim=-1)
-        return theta
+
+class _BasePotential():
+    def __init__(self, model: _BaseBayes, return_data: bool=True):
+        self._m = model
+        self._la = model._la
+        self._return_data = return_data
+
+    def _simulate_data(self, theta):
+        pass
+
+    def __call__(self, theta):
+        raise NotImplementedError
+
+class Exact(_BasePotential):
+    def __init__(self, model: _BaseBayes, return_data=True):
+        for k, (labelling_id, obmod) in enumerate(model._obmods.items()):
+            model.set_input_labelling(model._substrate_df.loc[labelling_id])  # NB check whether valid susbtrate_df
+            if not hasattr(obmod, 'log_lik'):
+                raise ValueError(f'model {obmod} for labelling {labelling_id} does not have a log_lik function,'
+                                 f'exact inference not possible')
+        if (model._bom is not None) and not hasattr(model._bom, 'log_lik'):
+            raise ValueError('BoundaryObservationModel does not have log_lik method, exact inference not possible')
+        super(self, _BasePotential).__init__(model, return_data)
+
+    def log_lik(self, theta):
+        vape = theta.shape
+        if len(vape) > 2:
+            theta = self._la.view(theta, shape=(math.prod(vape[:-1]), vape[-1]))
+        labelling_fluxes = self._m._fcm.map_theta_2_fluxes(theta)
+        mu_o = self._m.simulate(labelling_fluxes, n_obs=0)
+
+        n_f = self._m._model._fluxes.shape[0]
+        n_meas = self._m._x_meas.shape[0]
+        n_bom = 1 if self._m._bomsize > 0 else 0
+
+        log_lik = self._la.get_tensor(shape=(n_f, n_meas, len(self._m._obmods) + n_bom))
+
+        # FUCKING AROOND
+        # difff = self._la.get_tensor(shape=(n_f, n_meas, len(self._obmods) + n_bom))
+        # truedist = ((theta - self._true_theta) ** 2).mean(1)
+
+        if self._m._bomsize > 0:
+            bo_meas = self._m._x_meas[:, -self._m._bomsize:]
+            mu_bo = mu_o[:, 0, -self._m._bomsize:]
+            log_lik[..., -1] = self._m._bom.log_lik(bo_meas=bo_meas, mu_bo=mu_bo)
+
+            # FUCKING AROOND
+            # mu_bo = self._la.atleast_2d(mu_bo)  # shape = batch x n_bo
+            # bo_meas = self._la.atleast_2d(bo_meas)  # shape = n_obs x n_bo
+            # diff_bo = mu_bo[:, None, :] - bo_meas[:, None, :]  # shape = batch x n_obs x n_bo
+            # difff[..., -1] = (diff_bo ** 2).sum(-1)
+
+        for i, (labelling_id, obmod) in enumerate(self._m._obmods.items()):
+            j, k = self._m._obsize[labelling_id]
+            x_meas_o = self._m._x_meas[..., j:k]
+            mu_o_i = mu_o[:, 0, j:k]
+            ll = obmod.log_lik(x_meas_o, mu_o_i)
+            log_lik[..., i] = ll
+
+            # FUCKING AROOND
+            # x_meas = self._la.atleast_2d(x_meas_o)  # shape = n_meas x n_mdv
+            # mu_oo = self._la.atleast_2d(mu_o_i)  # shape = batch x n_d
+            # diff = mu_oo[:, None, :] - x_meas[:, None, :]  # shape = n_obs x batch x n_d
+            # difff[..., i] = (diff ** 2).sum(-1)
+
+        if sum:  # summing over observation models and over
+            log_lik = self._la.sum(log_lik, axis=(1, 2), keepdims=False)
+
+        if self._return_data:
+            return log_lik, mu_o
+        return log_lik
+
+    def log_prob(self, theta):
+        vape = theta.shape
+        if len(vape) > 2:
+            theta = self._la.view(theta, shape=(math.prod(vape[:-1]), vape[-1]))
+
+        n_f = theta.shape[0]
+        k = len(self._m._obmods) + (1 if self._bom is None else 2)  # the 2 is for a column of prior and boundary probabilities
+        n_meas = self._m._x_meas.shape[0]
+        log_prob = self._la.get_tensor(shape=(n_f, n_meas, k))
+
+        # if evaluate_prior:
+        #     # NB not necessary for uniform prior
+        #     # NB this also checks support! the hr is guaranteed to sample within the support
+        #     # NB since priors are currently torch objects, this will not work with numpy backend
+        #     #   which has proven the faster option for the hr-sampler
+        #     log_prob[..., -1] = self._prior.log_prob(theta)
+
+        log_lik = self.log_lik(theta, False)
+        if self._return_data:
+            log_lik, mu_o = log_lik
+
+        log_prob[..., :-1] = log_lik
+        log_prob = self._la.view(self._la.sum(log_prob, axis=(1, 2), keepdims=False), shape=vape[:-1])
+        if self._return_data:
+            return log_prob, self._la.view(mu_o, shape=(*vape[:-1], len(self._did)))
+        return log_prob
+
+    def __call__(self, theta):
+        pass
+
+class DistanceKernel(_BasePotential):
+    def __call__(
+            self,
+            theta,
+            epsilon,
+            n_obs=5,
+            metric='rmse',
+            return_data=False,
+            **kwargs
+    ):
+        if self._x_meas is None:
+            raise ValueError('set an observation first')
+        # NB we do not evaluate the log_prob of the measured boundary fluxes, since it is a constant for _x_meas
+
+        vape = theta.shape
+        if len(vape) > 2:
+            theta = self._la.view(theta, shape=(math.prod(vape[:-1]), vape[-1]))
+        labelling_fluxes = self._fcm.map_theta_2_fluxes(theta)
+        data = self.__call__(labelling_fluxes, n_obs=n_obs, **kwargs)
+
+        time = None
+        if isinstance(data, tuple):
+            data, time = data
+
+        data = self._la.unsqueeze(data, 0)  # artificially add a chains dimension!
+        if metric == 'rmse':
+            fobmod = next(iter(self._obmods.values()))
+            distances = fobmod.rmse(data, self._x_meas).squeeze(0)
+        else:
+            # TODO think of other distance metrics
+            raise ValueError
+
+        n_obshape = max(1, n_obs)
+        distances = self._la.view(distances, shape=vape[:-1])
+        if epsilon > -float('inf'):
+            distances[distances > epsilon] = float('nan')  # this indicates we reject samples with a large distance!
+        data = self._la.view(data, shape=(*vape[:-1], n_obshape, len(self._did)))
+        if return_data:
+            distances = distances, data
+        if time is not None:
+            return distances, time
+        return distances
+
+class Arbitrary():
+    def __init__(
+            self,
+            density: torch.distributions.Distribution,
+    ):
+        self.density = density
+
+    def __call__(self, theta, x_meas, return_data=False):
+        if return_data:
+            raise NotImplementedError
+        return self.density.log_prob(theta, context=x_meas)
+
+
+
+class Proposal():
+    def __init__(self):
+        pass
+
+
+class PerturbParticle():
+    pass
+
+
+class Transition(object):
+    def __init__(
+            self,
+            linalg,
+            n_cdf: int,
+
+    ):
+        self._P = linalg.get_tensor  # transition kernel G
+
+    def barker(self):
+        pass
+
+    def peskun(self):
+        pass
 
 
 class MCMC(_BaseBayes):
@@ -648,15 +763,7 @@ class MCMC(_BaseBayes):
 
                 P_j[diag_idxs, diag_idxs] = (1 - self._non_diag @ P_j)[diag_idxs]
                 print(P_j)
-
-
-
                 # P_j[]
-
-
-
-
-
 
                 # non_diag = self._la.vecopy(self._non_diag)
 
@@ -716,17 +823,13 @@ class MCMC(_BaseBayes):
         chord_std = self._la.get_tensor(values=np.array([chord_std]))
         xch_std = self._la.get_tensor(values=np.array([xch_std]))
 
-        if self._fcm._sampler.basis_coordinates == 'transformed':
-            raise NotImplementedError('transform the chains to transformed')
-
         batch_size = n_chains * n_cdf
-        if (self._la._batch_size != batch_size) or not self._model._is_built:
+        if self._la._batch_size != batch_size:
             # this way the batch processing is corrected
             self._la._batch_size = batch_size
-            self._model.build_simulator(**self._fcm.fcm_kwargs)
+            self._model.build_model(free_reaction_id=self._model._free_reaction_id)
 
-        n_rounded = self._fcm._sampler._F_round.A.shape[1] + self._nx
-        chains = self._la.get_tensor(shape=(n, n_chains, n_rounded))  # TODO this should be the number of dimensions in rounded coord system!
+        chains = self._la.get_tensor(shape=(n, n_chains, len(self.theta_id)))  # TODO this should be the number of dimensions in rounded coord system!
         post_probs = self._la.get_tensor(shape=(n, n_chains))
         accept_rate = self._la.get_tensor(shape=(n_chains,), dtype=np.int64)
 
@@ -734,10 +837,7 @@ class MCMC(_BaseBayes):
             sim_data = self._la.get_tensor(shape=(n, n_chains, len(self.data_id)))
 
         if initial_points is None:
-            y = self._sampler.get_initial_points(num_points=n_chains)
-            if self._prior._xch_prior is not None:
-                xch_basis_points = self._prior._xch_prior.sample((n_chains, ))
-                y = self._la.cat([y, xch_basis_points], dim=-1)
+            y = self._prior.sample((max(6, n_chains), ))[:n_chains, :]  # this is necessary since rsample in the prior has 6 chains
         else:
             y = initial_points
 
@@ -754,7 +854,7 @@ class MCMC(_BaseBayes):
                 )
             raise NotImplementedError('this is complicated, since we need to weight samples by the prior somehow')
 
-        chord_ys = self._la.get_tensor(shape=(1 + n_cdf, n_chains, n_rounded))
+        chord_ys = self._la.get_tensor(shape=(1 + n_cdf, n_chains, len(self.true_theta)))
         chord_post_probs = self._la.get_tensor(shape=(1 + n_cdf, n_chains))
         chord_prop_probs = self._la.get_tensor(shape=(1 + n_cdf, 1 + n_cdf, n_chains))
         pert_post_probs = self.potential(y)
@@ -785,74 +885,68 @@ class MCMC(_BaseBayes):
         )
         pbar = tqdm.tqdm(total=n_tot, ncols=100)
         i = 0
-        # try:
-        while i < n_tot:
-            pert_ys = self.perturb_particles(y, i, **perturb_kwargs)
-            if return_what:
-                pert_ys, pert_prop_probs = pert_ys
-                # two lines below only hold for symmetric proposals, otherwise we need to compute exactly
-                chord_prop_probs[0, 1] = pert_prop_probs
-                chord_prop_probs[1, 0] = pert_prop_probs
-
-            chord_ys[1:] = pert_ys
-            pert_post_probs = self.potential(pert_ys)
-
-            if self.potentype == 'approx':
-                raise NotImplementedError('reject ABC proposals if all are too distant!')
-
-            if return_data:
-                pert_post_probs, data = pert_post_probs
-                chord_data[1:] = data
-
-            chord_post_probs[1:] = pert_post_probs
-
-            if not return_what:
-                chord_prop_probs = self.compute_proposal_prob(
-                    old_particles=chord_ys,
-                    new_particles=chord_ys,
-                    chord_proposal=chord_proposal,
-                    chord_std=chord_std,
-                    xch_proposal=xch_proposal,
-                    xch_std=xch_std,
-                    old_is_new=True,
-                )
-            accept_idx = self.accept_reject(i, chord_post_probs, chord_prop_probs, pre_sample_batch, peskunize)
-            accepted_probs = chord_post_probs[accept_idx, chain_selector]
-            chord_post_probs[0] = accepted_probs  # set the log-probs of the current sample
-            y = chord_ys[accept_idx, chain_selector]
-            # print(chord_post_probs)
-            # print(accept_idx)
-            # print()
-            chord_ys[0] = y  # set the log-probs of the current sample
-            if return_data:
-                data = chord_data[accept_idx, chain_selector]
-                chord_data[0] = data
-
-            j = i - n_burn
-            pbar.update(1)
-            if j > 0:
-                if n_cdf > 1:
-                    accept_idx[accept_idx > 0] = 1
-                accept_rate += accept_idx
-                avg_rate = self._la.mean(accept_rate / j)
-                if j % 50 == 0:
-                    pbar.set_postfix(avg_acc=avg_rate.item())
-
-            if (j % thinning_factor == 0) and (j > -1):
-                k = j // thinning_factor
-                post_probs[k] = accepted_probs
-                chains[k] = y
-                if return_data:
-                    sim_data[k] = data
-            i += 1
         try:
-            pass
+            while i < n_tot:
+                pert_ys = self.perturb_particles(y, i, **perturb_kwargs)
+                if return_what:
+                    pert_ys, pert_prop_probs = pert_ys
+                    # two lines below only hold for symmetric proposals, otherwise we need to compute exactly
+                    chord_prop_probs[0, 1] = pert_prop_probs
+                    chord_prop_probs[1, 0] = pert_prop_probs
+
+                chord_ys[1:] = pert_ys
+                pert_post_probs = self.potential(pert_ys)
+
+                if self.potentype == 'approx':
+                    raise NotImplementedError('reject ABC proposals if all are too distant!')
+
+                if return_data:
+                    pert_post_probs, data = pert_post_probs
+                    chord_data[1:] = data
+
+                chord_post_probs[1:] = pert_post_probs
+
+                if not return_what:
+                    chord_prop_probs = self.compute_proposal_prob(
+                        old_particles=chord_ys,
+                        new_particles=chord_ys,
+                        chord_proposal=chord_proposal,
+                        chord_std=chord_std,
+                        xch_proposal=xch_proposal,
+                        xch_std=xch_std,
+                        old_is_new=True,
+                    )
+                accept_idx = self.accept_reject(i, chord_post_probs, chord_prop_probs, pre_sample_batch, peskunize)
+                accepted_probs = chord_post_probs[accept_idx, chain_selector]
+                chord_post_probs[0] = accepted_probs  # set the log-probs of the current sample
+                y = chord_ys[accept_idx, chain_selector]
+                chord_ys[0] = y  # set the log-probs of the current sample
+                if return_data:
+                    data = chord_data[accept_idx, chain_selector]
+                    chord_data[0] = data
+
+                j = i - n_burn
+                pbar.update(1)
+                if j > 0:
+                    if n_cdf > 1:
+                        accept_idx[accept_idx > 0] = 1
+                    accept_rate += accept_idx
+                    avg_rate = self._la.mean(accept_rate / j)
+                    if j % 50 == 0:
+                        pbar.set_postfix(avg_acc=avg_rate.item())
+
+                if (j % thinning_factor == 0) and (j > -1):
+                    k = j // thinning_factor
+                    post_probs[k] = accepted_probs
+                    chains[k] = y
+                    if return_data:
+                        sim_data[k] = data
+                i += 1
         except Exception as e:
             if e is not KeyboardInterrupt:
-                print(e)
+                raise
         finally:
             pbar.close()
-            chains = self.map_chains_2_theta(chains)
 
             if not return_az:
                 return chains
@@ -902,7 +996,7 @@ class MCMC(_BaseBayes):
             )
 
 
-class SMC(_BaseBayes):
+class SMC(_BaseBayes, DataSetSim):
     # https://www.annualreviews.org/doi/pdf/10.1146/annurev-ecolsys-102209-144621
     #  https://jblevins.org/notes/smc-intro
     #  https://www.stats.ox.ac.uk/~doucet/doucet_defreitas_gordon_smcbookintro.pdf
@@ -923,16 +1017,17 @@ class SMC(_BaseBayes):
                     raise ValueError(f'Observationmodel {obsmod} does not have a transformation and therefore '
                                      f'euclidian distance is not defined (data lies on simplices)')
         super(SMC, self).__init__(model, substrate_df, mdv_observation_models, prior, boundary_observation_model)
+
+        if num_processes < 0:
+            num_processes = psutil.cpu_count(logical=False)
         self._num_processes = num_processes
-        self._dss = DataSetSim(
-            model=model,
-            substrate_df=self._substrate_df,
-            mdv_observation_models=self._obmods,
-            boundary_observation_model=self._bom,
-            num_processes=num_processes,
-        )
-        # this is so that we can make compute_distances use the right simulation function
-        self.__call__ = partial(self._dss.__call__, close_pool=False)
+
+        self._mp_pool = None
+        if num_processes > 0:
+            self._mp_pool = mp.Pool(
+                processes=self._num_processes, initializer=init_observer,
+                initargs=(self._model, self._obmods)
+            )
 
     def _calculate_new_log_weights(
             self,
@@ -997,7 +1092,7 @@ class SMC(_BaseBayes):
         n = particles.shape[0]
         population_batch = min(n, population_batch)
 
-        chord_cov, xch_std = None, None
+        theta_cov, chord_cov, xch_std = None, None, None
         if (chord_proposal == 'gauss') or (xch_proposal == 'gauss'):
             theta_cov = self.mvn_kernel_variance(
                 particles,
@@ -1065,7 +1160,8 @@ class SMC(_BaseBayes):
                         new_data.append(data[is_accepted])
                     m += num_accepted_batch
         except Exception as e:
-            print(e)
+            if e is not KeyboardInterrupt:
+                raise
         finally:
             pbar.close()
             self._totime.append(pbar.format_dict['elapsed'])
@@ -1088,8 +1184,8 @@ class SMC(_BaseBayes):
             new_log_weights,
             new_distances,
             new_data,
+            theta_cov,
         )
-
 
     def _arviz_2_partial_mdv(self, result: az.InferenceData):
         # this renames stuff so that the data is now partial MDVs and the log-ratio data is called lr_data
@@ -1142,6 +1238,9 @@ class SMC(_BaseBayes):
         )
         result.observed_data['observed_data'] = observed
         return result
+
+    def restore_populations_from_InferenceData(self, az_InfDat: az.InferenceData):
+        pass
 
     def run(
             self,
@@ -1202,12 +1301,12 @@ class SMC(_BaseBayes):
                     log_weights = self._la.log(1 / n * self._la.ones(n))
 
                     if return_all_populations:
-                        all_particles = [particles]
-                        all_log_weights = [log_weights]
-                        all_distances = [dist]
-                        all_epsilons = [epsilon]
+                        self._all_particles = [particles]
+                        self._all_log_weights = [log_weights]
+                        self._all_distances = [dist]
+                        self._all_epsilons = [epsilon]
                         if return_data:
-                            all_data = [data[sortidx][:n]]
+                            self._all_data = [data[sortidx][:n]]
                 else:
                     if distance_based_decay:
                         # Quantile of last population
@@ -1217,8 +1316,8 @@ class SMC(_BaseBayes):
                         # Constant decay.
                         epsilon *= epsilon_decay
 
-                    particles, log_weights, dist, data = self._sample_next_population(
-                        particles=particles,
+                    particles, log_weights, dist, data, theta_cov = self._sample_next_population(
+                        particles=particles,  # TODO: work out how to do this when keyboard interrupted
                         log_weights=log_weights,
                         epsilon=epsilon,
                         population_batch=population_batch,
@@ -1229,22 +1328,23 @@ class SMC(_BaseBayes):
                         evaluate_prior=evaluate_prior,
                     )
                     if return_all_populations:
-                        all_particles.append(particles)
-                        all_log_weights.append(log_weights)
-                        all_distances.append(dist)
-                        all_epsilons.append(epsilon)
+                        self._all_particles.append(particles)
+                        self._all_log_weights.append(log_weights)
+                        self._all_distances.append(dist)
+                        self._all_epsilons.append(epsilon)
                         if return_data:
-                            all_data.append(data)
+                            self._all_data.append(data)
         except Exception as e:
-            print(e)
+            if e is not KeyboardInterrupt:
+                raise
         finally:
             if return_all_populations:
-                particles = self._la.stack(all_particles, 0)
-                log_weights = self._la.stack(all_log_weights, 0)
-                dist = self._la.stack(all_distances, 0)
-                epsilon = self._la.stack(all_epsilons, 0)
+                particles = self._la.stack(self._all_particles, 0)
+                log_weights = self._la.stack(self._all_log_weights, 0)
+                dist = self._la.stack(self._all_distances, 0)
+                epsilon = self._la.stack(self._all_epsilons, 0)
                 if return_data:
-                    data = self._la.stack(all_data, 0)
+                    data = self._la.stack(self._all_data, 0)
             else:
                 # add the 'chains' dimension
                 particles = particles[None, ...]
@@ -1312,157 +1412,5 @@ class SMC(_BaseBayes):
 
 
 if __name__ == "__main__":
-    pd.set_option('display.max_rows', 500)
-    pd.set_option('display.max_columns', 500)
-    pd.set_option('display.width', 1000)
-    np.set_printoptions(linewidth=500)
-
-    from sbmfi.models.small_models import spiro, multi_modal
-    from sbmfi.models.build_models import build_e_coli_anton_glc, _bmid_ANTON
-    from sbmfi.inference.priors import UniNetFluxPrior, ProjectionPrior
-    from sbmfi.inference.complotting import PlotMonster
-    from sbmfi.core.polytopia import FluxCoordinateMapper, PolytopeSamplingModel, sample_polytope, fast_FVA
-    import pickle
-    from sbmfi.core.observation import MVN_BoundaryObservationModel
-
-    model, kwargs = multi_modal(backend='torch')
-    mcmc = MCMC(
-        model=model,
-        substrate_df=kwargs['substrate_df'],
-        mdv_observation_models=kwargs['basebayes']._obmods,
-        prior=kwargs['basebayes']._prior,
-        boundary_observation_model=kwargs['basebayes']._bom
-    )
-    mcmc.set_measurement(x_meas=kwargs['measurements']) # [:, :-3]
-    mcmc.set_true_theta(theta=kwargs['true_theta'])
-    res = mcmc.run(
-        n=4000, n_burn=0, thinning_factor=1, n_cdf=1, n_chains=1, chord_std=0.3, peskunize=True,
-        chord_proposal='gauss', xch_proposal='gauss', xch_std=0.4
-    )
-    # pm = PlotMonster(model._fcm._sampler.basis_polytope, res)
-    import holoviews as hv
-
-    # hv.save(pm.grand_theta_plot(var1_id='R_a_in', var2_id='R_v4'), 'ding', fmt='html', backend='bokeh')
-
-    print(
-        (res.posterior['theta'].values[:,:,-1] > 0.).sum() / len(res.posterior['chain'])
-    )
-
-    # hdf = r"C:\python_projects\sbmfi\spiro_flow_lowsigma.h5"
-    # did = 'sims'
-    #
-    # model, kwargs = spiro(
-    #     backend='torch', v2_reversible=True, v5_reversible=False, build_simulator=True, which_measurements='com',
-    #     which_labellings=['A', 'B'], transformation='ilr'
-    # )
-    # dss = DataSetSim(
-    #     model=model,
-    #     substrate_df=kwargs['substrate_df'],
-    #     mdv_observation_models=kwargs['basebayes']._obmods,
-    #     boundary_observation_model=kwargs['basebayes']._bom,
-    #     num_processes=0,
-    # )
-    # ilr_data = dss.read_hdf(hdf, dataset_id=did, what='data', stop=1000)
-    # theta = dss.read_hdf(hdf=hdf, dataset_id=did, what='theta', stop=1000)
-    # mdv_data = dss.to_partial_mdvs(ilr_data, pandalize=False)
-    #
-    # model, kwargs = spiro(
-    #     backend='torch', v2_reversible=True, v5_reversible=False, build_simulator=True, which_measurements='com',
-    #     which_labellings=['A', 'B'], transformation=None
-    #
-    # )
-    # up = UniNetFluxPrior(model.flux_coordinate_mapper, cache_size=100000)
-    #
-    # bom = MVN_BoundaryObservationModel(model, kwargs['basebayes']._bom._bound_id.values, biomass_std=0.01, boundary_std=0.03)
-    #
-    # dss = DataSetSim(
-    #     model=model,
-    #     substrate_df=kwargs['substrate_df'],
-    #     mdv_observation_models=kwargs['basebayes']._obmods,
-    #     boundary_observation_model=kwargs['basebayes']._bom,
-    #     num_processes=0,
-    # )
-    # mcmc = MCMC(model, dss._substrate_df, dss._obmods, prior=up, boundary_observation_model=dss._bom)
-    #
-    #
-    # idx = 265
-    # x = mdv_data[[idx], 0]
-    # y = theta[[idx]]
-    # mcmc.set_measurement(x_meas=x) # [:, :-3]
-    # mcmc.set_true_theta(theta=pd.Series(y[0].numpy(), mcmc.theta_id))
-    # res = mcmc.run(
-    #     n=10000, n_burn=0, thinning_factor=1, n_cdf=1, n_chains=4, chord_std=0.0000000001, peskunize=True,
-    #     chord_proposal='gauss', xch_proposal='gauss', xch_std=0.4
-    # )
-
-
-    # model, kwargs = build_e_coli_anton_glc(
-    #     backend='numpy',
-    #     auto_diff=False,
-    #     build_simulator=True,
-    #     ratios=False,
-    #     batch_size=25,
-    #     which_measurements='tomek',
-    #     which_labellings=['20% [U]Glc', '[1]Glc'],
-    #     measured_boundary_fluxes=[_bmid_ANTON, 'EX_glc__D_e', 'EX_ac_e'],
-    #     seed=1,
-    # )
-    #
-    # sdf = kwargs['substrate_df']
-    # dss = kwargs['basebayes']
-    # simm = dss._obmods
-    # bom = dss._bom
-    # up = UniNetFluxPrior(model, cache_size=2000)
-    #
-    # smc = SMC(
-    #     model=model,
-    #     substrate_df=sdf,
-    #     mdv_observation_models=simm,
-    #     boundary_observation_model=bom,
-    #     prior=up,
-    #     num_processes=0,
-    # )
-    # smc.set_measurement(x_meas=kwargs['measurements'])
-    # smc.set_true_theta(theta=kwargs['theta'])
-    #
-    # result = az.from_netcdf("C:/python_projects/sbmfi/SMC_e_coli_glc_tomek_obsmod_copy_NEW.nc")
-    #
-    # result = smc._arviz_2_partial_mdv(result)
-    # # model, kwargs = build_e_coli_anton_glc()
-    #
-    # # model, kwargs = spiro(
-    # #     seed=None,
-    # #     batch_size=50,
-    # #     backend='torch', v2_reversible=True, ratios=False, build_simulator=True,
-    # #     which_measurements='lcms', which_labellings=['A', 'B'], v5_reversible=True
-    # # )
-    # # sdf = kwargs['substrate_df']
-    # # bb = kwargs['basebayes']
-    # # up = UniNetFluxPrior(model._fcm)
-    # # smc = SMC(model, sdf, bb._obmods, prior=up, boundary_observation_model=bb._bom, num_processes=0)
-    # # smc.set_measurement(x_meas=kwargs['measurements'])
-    # # smc.set_true_theta(theta=kwargs['theta'])
-    # #
-    # # res = smc.run(n=5000, n_smc_steps=8, epsilon_decay=0.4, return_all_populations=True, )
-    # # az.to_netcdf(res, 'spiro_TEST_SMC.nc')
-    #
-    # # model2, kwargs2 = spiro(
-    # #     seed=9, batch_size=2,
-    # #     backend='torch', v2_reversible=True, ratios=False, build_simulator=True,
-    # #     which_measurements='com', which_labellings=['C', 'D'], v5_reversible=True, include_bom=True
-    # # )
-    # # up = UniNetFluxPrior(model2._fcm)
-    # # bb2 = kwargs2['basebayes']
-    # # sdf = kwargs2['substrate_df']
-    # # mcmc = MCMC(model2, sdf, bb2._obmods, prior=up, boundary_observation_model=bb2._bom)
-    # # mcmc.set_measurement(x_meas=kwargs2['measurements'])
-    # mcmc.set_true_theta(theta=kwargs2['theta'])
-    # # res = mcmc.run(
-    # #     n=20, n_burn=0, thinning_factor=1, n_cdf=1, n_chains=2, chord_std=0.6, peskunize=True,
-    # #     chord_proposal='gauss', xch_proposal='gauss', xch_std=0.4
-    # # )
-    # # print(profile2.print_stats())
-    # # mcmc.simulate_data(res, n=10000)
-    # # az.to_netcdf(res, 'spiro_TEST_MCMC.nc')
-
+    pass
 

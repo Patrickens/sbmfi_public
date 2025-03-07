@@ -14,6 +14,7 @@ class LabellingReaction(Reaction):
     """Base class for reactions in either cumomer or EMU simulation algorithms
     bi-directional refers to net-flux proceeding in both directions and
     # TODO reaction.forward_variable and reaction.reverse_variable do now work with _rev_reactions
+    # TODO nee to fix when to set _is_built = False, we only want to update fcm and the like, not necessarily all matrices for EMU simulation
     Attributes
     ----------
     atom_map : collections.OrderedDict
@@ -28,25 +29,17 @@ class LabellingReaction(Reaction):
     _TYPE_METABOLITE = LabelledMetabolite
     def __init__(
             self,
-            idr=None,
-            name: str = '',
-            subsystem: str = '',
-            lower_bound: float = 0.0,
-            upper_bound: float = None,
+            reaction:Reaction,
             rho_min: float = 0.0,
             rho_max: float = 0.0,
-            tau: float = 1.0,
             pseudo: bool = False,
     ):
-        if type(idr) == Reaction:
-            self.__dict__.update(idr.__dict__)
-        elif type(idr) == LabellingReaction:
+        if isinstance(reaction, LabellingReaction):
             raise NotImplementedError
-        elif isinstance(idr, str) or (idr is None):
-            Reaction.__init__(
-                self, id=idr, name=name, subsystem=subsystem,
-                lower_bound=lower_bound, upper_bound=upper_bound
-            )
+        if isinstance(reaction, Reaction):
+            self.__dict__.update(reaction.__dict__)
+        else:
+            raise ValueError(f'need to instantiate with a cobra Reaction object, got {type(reaction)}')
 
         self._pseudo = pseudo
 
@@ -54,26 +47,26 @@ class LabellingReaction(Reaction):
         self._rect_prod_map: np.array = None  # mapping all reactant atoms to (present) product atoms
         self._rho_min = 0.0  # minimal fraction of flux going in the reverse direction; has to do with Gibbs free energy change
         self._rho_max = 0.0
-        self._tau  = 1.0  # tau \geq 1; constant is used to automatically scale rho_min to account for path dependency
         self._dgibbsr  = 0.0  # the currently set dGr
 
-        # this default selection is important when initializing with a id_or_reaction=Reaction
-        self.rho_max = rho_max
-        self.rho_min = rho_min
-        self.tau = tau
+        if not self._pseudo:
+            # this default selection is important when initializing with a id_or_reaction=Reaction
+            self.rho_max = rho_max
+            self.rho_min = rho_min
 
-        # rev_reac is a unidirectional reaction in the opposite direction of self
-        self._rev_reaction = None
-        self._initialize_rev_reaction()
+            # rev_reac is a unidirectional reaction in the opposite direction of self
+            self._rev_reaction = None
+            self._initialize_rev_reaction()
 
     def _initialize_rev_reaction(self):
         if not self._pseudo:  # we dont need a rev_reaction for pseudo-reactions
             rid = self.id
             if rid is None:
                 rid = ''
-            self._rev_reaction: LabellingReaction = type(self)(
-                idr=rid + '_rev', lower_bound=0.0, upper_bound=1.0, rho_max=0.0, pseudo=True
-            )
+            reaction = Reaction(id=rid + '_rev', lower_bound=0.0, upper_bound=1.0)
+            reaction._metabolites = {k: -v for k, v in self._metabolites.items()}  # add_metabolites also changes bounds
+            reaction._model = self._model
+            self._rev_reaction = type(self)(reaction=reaction, pseudo=True)
             self._rev_reaction._rev_reaction = self  # the reverse of the reverse reaction is self
 
     def __setstate__(self, state):
@@ -271,11 +264,10 @@ class LabellingReaction(Reaction):
                 if (self.model is not None) and not self._pseudo:
                     Reaction.update_variable_bounds(self)  # standard cobrapy behavior
 
-        if self.bounds == (0.0, 0.0):
-            self._model._is_built = False  # need to rerun
-
-        # this is to make sure that all changes in rho_max and bounds are reflected in labellingreactions
-        self._model._labelling_reactions = DictList()
+        if self._model is not None:
+            self._model._is_built = False  # needs to rerun to update model._fcm and the like
+            # this is to make sure that all changes in rho_max and bounds are reflected in labellingreactions
+            self._model._labelling_reactions = DictList()
 
     @property
     def pseudo(self):
@@ -296,19 +288,6 @@ class LabellingReaction(Reaction):
     @property
     def atom_map(self):
         return self._atom_map.copy()
-
-    @property
-    def tau(self):
-        return self._tau
-
-    @tau.setter
-    def tau(self, val:float):
-        if not val >= 1.0:
-            raise ValueError(f'tau: {val}!')
-        self._tau = val
-        if self._dgibbsr != 0.0:
-            pass
-            # self.set_dGr(dGr=self._dGr, update_bounds=True) # TODO update this
 
     def _check_rho_bounds(self, rho_min=None, rho_max=None):
         if rho_min is None:
@@ -380,10 +359,7 @@ class LabellingReaction(Reaction):
             rho_min, rho_max = 0.0, self._RHO_MAX
         else:
             rho_min = np.exp(dgibbsr / (self._R * self.T))
-            if self._tau > 1.0:
-                rho_max = np.exp((dgibbsr / self._tau) / (self._R * self.T))
-            else:
-                rho_max = rho_min
+            rho_max = rho_min
             if dgibbsr > 0.0:
                 # chose to keep the min(v_fwd, v_rev) frame of reference!
                 rho_min, rho_max = 1.0 / rho_min, 1.0 / rho_max
@@ -411,29 +387,21 @@ class LabellingReaction(Reaction):
         """
         if not atom_map:
             return
+        if self._model is None:
+            raise ValueError('this only works once the reaction is part of a model')
         if not self.metabolites:
-            if self.pseudo:
-                # add_metabolites adds constraints to model
-                self._metabolites = {met: stoich for met, (stoich, atoms) in atom_map.items()}
-            else:
-                self.add_metabolites(
-                    metabolites_to_add={met: stoich for met, (stoich, atoms) in atom_map.items()}, combine=False,
-                )
+            raise ValueError('the reaction needs to be defined already')
 
         map = {}
         for metabolite, (stoich, atoms) in atom_map.items():
             if not isinstance(metabolite, LabelledMetabolite):
                 raise ValueError(f'{self.id} atom_map contains non-LabelledMetabolite object: {metabolite.id}')
 
-            if self.model is not None:
-                if metabolite in self.model.metabolites:
-                    model_met = self.model.metabolites.get_by_id(metabolite.id)
-                elif metabolite in self.model.pseudo_metabolites:
-                    model_met = self.model.pseudo_metabolites.get_by_id(metabolite.id)
-                else:
-                    model_met = None
-                if (metabolite is not model_met) or (metabolite._model is not self._model):
-                    raise ValueError(f'first use model.fix_metabolite_reference_mess(...) {metabolite.id}!')
+            if metabolite in self.model.metabolites:
+                model_met = self.model.metabolites.get_by_id(metabolite.id)
+
+            if (metabolite is not model_met) or (metabolite._model is not self._model):
+                raise ValueError(f'first use model.repair(), the references are messed up for: {metabolite.id}!')
 
             for met_met, stoich_met in list(self._metabolites.items()):
                 if metabolite.id == met_met.id:
@@ -442,13 +410,7 @@ class LabellingReaction(Reaction):
                             f'{self.id}: for {metabolite.id} stoichiometry and atom mapping are inconsistent'
                         )
                     if metabolite is not met_met:
-                        self._metabolites[metabolite] = self._metabolites.pop(met_met)
-
-            # cleaning up the reference mess
-            metabolite._reaction.add(self)
-            for reaction in list(metabolite._reaction):
-                if (reaction.id == self.id) and (reaction is not self):
-                    metabolite._reaction.remove(reaction)
+                        raise ValueError('metabolite in atom_map is not equal to metabolite in self.metabolites')
 
             for atom in atoms:
                 if (atom is not None) and (metabolite.elements['C'] != len(atom)):
@@ -484,10 +446,11 @@ class LabellingReaction(Reaction):
                 (met, (-stoich, atoms)) for met, (stoich, atoms) in self._atom_map.items()
             ]))
 
-    def build_atom_map_from_string(self, atom_map_str: str, metabolite_kwargs: dict = None):
+    def build_atom_map_from_string(self, atom_map_str: str):
         # TODO: make it possible to build entire reaction from string with co-factors and all
-        if metabolite_kwargs is None:
-            metabolite_kwargs = {}
+
+        if self._model is None:
+            raise ValueError('this only works once the reaction is part of a model')
 
         rects, arrow, prods = _read_atom_map_str_rex.findall(string=atom_map_str)[0]
         is_biomass = _find_biomass_rex.search(rects) is not None
@@ -495,7 +458,7 @@ class LabellingReaction(Reaction):
         if ((arrow == '<=>') and not self.reversibility) or \
                 (('==' in arrow) and self.reversibility) or \
                 (('--' in arrow) and (self.reversibility or self.rho_max != 0.0)):
-            print(f'wrong arrow or bounds {self.id}')
+            print(f'wrong arrow or bounds {self.id} {atom_map_str}, {self.bounds}, {self.rho_min, self.rho_min}')
 
         if ('=' in arrow) and (self.rho_max == 0.0):
             # for when we dont pass rho_max as an explicit argument
@@ -519,50 +482,22 @@ class LabellingReaction(Reaction):
             rects = [rect.split('/')[0].strip() for rect in rects.split('+')]
             prods = [prod.split('/')[0].strip() for prod in prods.split('+')]
 
-            met_mets = DictList(self.metabolites)
-            created_mets = DictList()  # necessary for when no model is associated with this reaction
             for intermediate in intermediates:
                 intermediate = intermediate.strip()
 
                 if intermediate == '∅':  # deals with boundary reactions of the pysumo model
                     continue
-
-                met_id, atoms = intermediate.split('/')
+                met_atoms = intermediate.split('/')
+                if len(met_atoms) == 1:
+                    # this indicates that there is a cofactor in the atom_map_str
+                    continue
+                met_id, atoms = met_atoms
                 atoms_arr = tuple(atoms)
 
-                comparmented_kwargs = metabolite_kwargs.get(met_id, {})
-                compartment = _strip_bigg_rex.search(met_id)
-                if compartment is not None:
-                    compartment = compartment.group()[1:]
-                compartment = comparmented_kwargs.get('compartment', compartment)
-
-                no_compartment = _strip_bigg_rex.sub('', met_id)
-                compartmentless_kwargs = metabolite_kwargs.get(no_compartment, {})
-                formula = compartmentless_kwargs.get('formula', 'C' + str(len(atoms_arr)))
-
-                all_kwargs = {**compartmentless_kwargs, **comparmented_kwargs}
-
-                if met_id in created_mets:
-                    metabolite = created_mets.get_by_id(id=met_id)
-                elif (self.model is not None) and (met_id in self.model.metabolites):
+                if met_id in self.model.metabolites:
                     metabolite = self.model.metabolites.get_by_id(id=met_id)
-                elif (self.model is not None) and (met_id in self.model._pseudo_metabolites):
-                    metabolite = self.model._pseudo_metabolites.get_by_id(id=met_id)
-                elif met_id in met_mets:
-                    metabolite = met_mets.get_by_id(id=met_id)
                 else:
-                    metabolite = self._TYPE_METABOLITE(idm=met_id, formula=formula, compartment=compartment)
-                    created_mets.append(metabolite)
-
-                if not isinstance(metabolite, LabelledMetabolite):
-                    # this means that met._reaction is also copied, thus not breaking references
-                    metabolite = self._TYPE_METABOLITE(idm=metabolite)
-                    created_mets.append(metabolite)
-
-                for kwarg, value in all_kwargs.items():
-                    if not hasattr(metabolite, kwarg):
-                        raise ValueError(f'Faulty metabolite kwargs {met_id}: {kwarg}')
-                    setattr(metabolite, kwarg, value)
+                    raise ValueError('metabolite not part of model')
 
                 if metabolite not in atom_map:
                     atom_map[metabolite] = (0, [])
@@ -575,25 +510,19 @@ class LabellingReaction(Reaction):
                     stoich += 1
                 atom_map[metabolite] = (stoich, atoms)
                 atoms.append(atoms_arr)
-        return atom_map
+        return atom_map, is_biomass
 
     def add_metabolites(self, metabolites_to_add, combine=True, reversibly=True):
-        Reaction.add_metabolites(self, metabolites_to_add, combine=combine, reversibly=reversibly)
-        if not self._pseudo:
-            self._rev_reaction.add_metabolites(
-                metabolites_to_add={m: -s for m, s in metabolites_to_add.items()},
-                combine=combine, reversibly=reversibly
-            )
+        raise NotImplementedError('Please finish all cobra Reaction objects in terms of metabolites and genes'
+                                  'before turning them into LabellingReaction objects; '
+                                  'LabellingReactions are equipped with atom_maps, which would also have to be '
+                                  'redefined, which we chose to handle in one fell swoop at instantiation.')
 
     def subtract_metabolites(self, metabolites: dict, combine: bool = True, reversibly: bool = True):
-        # NB we need this for pta.tfs I believe, since remove_reactions is called a bunch of times
-        Reaction.subtract_metabolites(self, metabolites=metabolites, combine=combine, reversibly=reversibly)
-        self._atom_map = {}
-        if not self._pseudo:
-            self._rev_reaction._atom_map = {}
-            self._rev_reaction.subtract_metabolites(
-                metabolites={m: -s for m, s in metabolites.items()}, combine=combine, reversibly=reversibly
-            )
+        raise NotImplementedError('Please finish all cobra Reaction objects in terms of metabolites and genes'
+                                  'before turning them into LabellingReaction objects; '
+                                  'LabellingReactions are equipped with atom_maps, which would also have to be '
+                                  'redefined, which we chose to handle in one fell swoop at instantiation.')
 
     def copy(self):
         model = self._model
@@ -630,11 +559,7 @@ class EMU_Reaction(LabellingReaction):
     _TYPE_METABOLITE = EMU_Metabolite
     def __init__(
             self,
-            idr=None,
-            name='',
-            subsystem='',
-            lower_bound=0.0,
-            upper_bound=None,
+            reaction: Reaction,
             rho_min: float = 0.0,
             rho_max: float = 0.0,
             pseudo = False,
@@ -654,7 +579,7 @@ class EMU_Reaction(LabellingReaction):
         state['B_tensors'] = {}
         return state
 
-    def _find_reactant_emus(self, product_emu: EMU, input_metabolites: Iterable, n_eq_EMU=1, eq_EMU=None) -> list:
+    def _find_reactant_emus(self, product_emu: EMU, substrate_metabolites: Iterable, n_eq_EMU=1, eq_EMU=None) -> list:
         if not product_emu.metabolite in self.gettants(reactant=False):
             raise ValueError('pjurre kenss')
         prod_stoich, all_prod_atoms = self._atom_map[product_emu.metabolite]
@@ -672,7 +597,7 @@ class EMU_Reaction(LabellingReaction):
                     positions = np.where(emu_atoms[:, None] == rect_atoms[None, :])[1]
                     if positions.size:
                         reactant_emu = metabolite.get_emu(positions=positions)
-                        if (reactant_emu.weight < product_emu.weight) or (metabolite in input_metabolites):
+                        if (reactant_emu.weight < product_emu.weight) or (metabolite in substrate_metabolites):
                             convolvers.append(reactant_emu)
                             tot_weight += reactant_emu.weight
                             if tot_weight < product_emu.weight:
@@ -705,9 +630,9 @@ class EMU_Reaction(LabellingReaction):
                         allements.append(element)
         return allements
 
-    def map_reactants_products(self, product_emu: EMU, input_metabolites: Iterable):
+    def map_reactants_products(self, product_emu: EMU, substrate_metabolites: Iterable):
         if not product_emu.metabolite.symmetric:
-            self._find_reactant_emus(product_emu=product_emu, input_metabolites=input_metabolites)
+            self._find_reactant_emus(product_emu=product_emu, substrate_metabolites=substrate_metabolites)
             return self._product_elements(product_emu=product_emu)
 
         product_metabolite = product_emu.metabolite
@@ -716,14 +641,14 @@ class EMU_Reaction(LabellingReaction):
         sym_emu_positions.sort()
 
         if all(sym_emu_positions == product_emu.positions):
-            self._find_reactant_emus(product_emu=product_emu, input_metabolites=input_metabolites)
+            self._find_reactant_emus(product_emu=product_emu, substrate_metabolites=substrate_metabolites)
             return self._product_elements(product_emu=product_emu)
 
         sym_product_emu = product_metabolite.get_emu(positions=sym_emu_positions)
-        self._find_reactant_emus(product_emu=product_emu, input_metabolites=input_metabolites, n_eq_EMU=2)
+        self._find_reactant_emus(product_emu=product_emu, substrate_metabolites=substrate_metabolites, n_eq_EMU=2)
         elements = self._product_elements(product_emu=product_emu)
         self._find_reactant_emus(
-            product_emu=product_emu, input_metabolites=input_metabolites, n_eq_EMU=2, eq_EMU=sym_product_emu
+            product_emu=product_emu, substrate_metabolites=substrate_metabolites, n_eq_EMU=2, eq_EMU=sym_product_emu
         )
         return elements + self._product_elements(product_emu=sym_product_emu)
 
@@ -762,7 +687,7 @@ class EMU_Reaction(LabellingReaction):
     def pretty_tensors(self, weight: int):
         if self.model is None:
             raise ValueError('no model')
-        elif not self.model._is_built:
+        elif not self.model.is_built:
             raise ValueError('model not built')
         result = {}
         if weight == 0:

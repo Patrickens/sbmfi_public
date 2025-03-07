@@ -1,6 +1,13 @@
 import math
 
-from sbmfi.core.polytopia import PolytopeSamplingModel, V_representation, fast_FVA, LabellingPolytope
+from sbmfi.core.polytopia import (
+    PolytopeSamplingModel,
+    V_representation,
+    fast_FVA,
+    LabellingPolytope,
+    thermo_2_net_polytope
+)
+from sbmfi.core.coordinater import FluxCoordinateMapper
 from sbmfi.inference.arviz_monkey import *
 import pandas as pd
 import holoviews as hv
@@ -11,7 +18,7 @@ from bokeh.plotting import show
 from bokeh.io import output_file
 import matplotlib.pyplot as plt
 import colorcet
-from sbmfi.core.polytopia import thermo_2_net_polytope
+
 
 class PlotMonster(object):
     _ALLFONTSIZES = {
@@ -40,7 +47,7 @@ class PlotMonster(object):
     }
     def __init__(
             self,
-            polytope: LabellingPolytope,  # this should be in the sampled basis!
+            fcm: FluxCoordinateMapper,  # this should be in the sampled basis!
             inference_data: az.InferenceData,
             v_rep: pd.DataFrame = None,
             hv_backend='matplotlib',
@@ -48,7 +55,6 @@ class PlotMonster(object):
         # TODO make sure we can plot exchange fluxes!
         hv.extension(hv_backend)
         self._hvb = hv_backend == 'matplotlib'
-        self._pol = polytope
         if isinstance(inference_data, str):
             inference_data = az.from_netcdf(inference_data)
         self._data = inference_data
@@ -81,24 +87,21 @@ class PlotMonster(object):
         if ('posterior' not in inference_data) and ('prior' in inference_data):
             self._ingroup = 'prior'
 
-        if not all(polytope.A.columns.isin(inference_data[self._ingroup].theta_id.values)):
+        if not all(fcm.theta_id().isin(inference_data[self._ingroup].theta_id.values)):
             print(self._ingroup, )
-            print(polytope.A.columns)
+            print(fcm.theta_id())
             print(inference_data[self._ingroup].theta_id.values)
             raise ValueError
 
-        net_pol = thermo_2_net_polytope(polytope)
         if v_rep is None:
-            v_rep = V_representation(net_pol, number_type='fraction')
-        else:
-            if not v_rep.columns.equals(net_pol.A.columns):
-                raise ValueError
+            v_rep = V_representation(fcm._sampler._F_round)
 
         self._v_rep = v_rep
-        self._fva = fast_FVA(polytope)
+        self._fva = fast_FVA(fcm._sampler._F_round)
         if 'observed_data' in self._data:
             self._odf = self._load_observed_data()
         self._ttdf = self._load_true_theta()
+        # self._max_prob_point = self._load_max_prob_point()
 
     @property
     def obsdat_df(self):
@@ -327,6 +330,8 @@ class PlotMonster(object):
         true_theta = self._data.attrs.get('true_theta')
         if true_theta is None:
             return
+        if true_theta.ndim == 1:
+            true_theta = true_theta[None, :]
         return pd.DataFrame(true_theta, columns=theta_id)
 
     def point_plot(self, var1_id, var2_id=None, what_var='theta', what_point='true', label=None, color=None):
@@ -340,10 +345,10 @@ class PlotMonster(object):
         else:
             raise ValueError
 
-        if what_point == 'map':
-            if what_var not in self._map:
+        if what_point == 'max_prob':
+            if what_var not in self._max_prob_point:
                 raise ValueError(f'{what_var} not in InferenceData')
-            to_plot = self._map[what_var]
+            to_plot = self._max_prob_point[what_var]
             linstyle = 'dashed'
         elif what_point == 'true':
             if self._ttdf is None:
@@ -353,6 +358,7 @@ class PlotMonster(object):
             else:
                 to_plot = self._odf
             linstyle = 'dotted'
+        print(to_plot)
 
         if label is None:
             label = what_point
@@ -365,66 +371,23 @@ class PlotMonster(object):
                 opts['linewidth'] = opts.pop('line_width')
                 opts['linestyle'] = opts.pop('line_dash')
             return hv.VLine(data).opts(**opts) * hv.Spikes(data, label=label).opts(**opts)
-        opts = dict(size=22)
+        opts = dict(size=4)
         if self._hvb:
             opts['s'] = opts.pop('size')
         return hv.Points(to_plot.loc[:, [var1_id, var2_id]], kdims=[xax, yax], label=what_point).opts(
             color=color, fontsize=self._FONTSIZES, **opts
         )
 
-    def observed_data_plot(self, var1_id, var2_id=None, what='map'):
-        if var2_id is None:
-            return hv.VLine(self.obsdat_df.loc[:, var1_id].values).opts(
-                color=self._colors['true_theta'], line_dash='dashed', xrotation=90
-            )
-        return hv.Points(self.obsdat_df.loc[:, [var1_id, var2_id]], kdims=[var1_id, var2_id]).opts(
-            color=self._colors['true_theta'], size=7, fontsize=self._FONTSIZES
-        )
+    # def observed_data_plot(self, var1_id, var2_id=None, what='max_prob'):
+    #     if var2_id is None:
+    #         return hv.VLine(self.obsdat_df.loc[:, var1_id].values).opts(
+    #             color=self._colors['true_theta'], line_dash='dashed', xrotation=90
+    #         )
+    #     return hv.Points(self.obsdat_df.loc[:, [var1_id, var2_id]], kdims=[var1_id, var2_id]).opts(
+    #         color=self._colors['true_theta'], size=7, fontsize=self._FONTSIZES
+    #     )
 
-    def grand_data_plot(self, var_names: Iterable):
-        plots = []
-        cols = 3
-        for i, var_id in enumerate(var_names):
-            show_legend = True if i == cols - 1 else False
-            postpred = self.density_plot(var_id, group='posterior_predictive')
-            priopred = self.density_plot(var_id, group='prior_predictive')
-            true = self.point_plot(var_id, what_var='data', what_point='true')
-            map = self.point_plot(var_id, what_var='data', what_point='map')
-            width = 600 if i % cols == cols - 1 else 400
-            size_opts = self._size_opts(width=width)
-            panel = (postpred * priopred * true * map).opts(
-                legend_position='right', show_legend=show_legend, show_grid=True, fontsize=self._FONTSIZES,
-                ylabel='', **size_opts
-            )
-            plots.append(panel)
-
-        return hv.Layout(plots).cols(cols)
-
-    def grand_theta_plot(self, var1_id, var2_id, group='posterior'):
-        plots = [
-            self._plot_polytope_area(var1_id, var2_id),
-            self._data_hull(var1_id=var1_id, var2_id=var2_id, group=group),
-            self._bivariate_plot(var1_id=var1_id, var2_id=var2_id, group=group),
-        ]
-        if group == 'posterior':
-            plots.append(self.point_plot(var1_id=var1_id, var2_id=var2_id, what_point='true'))
-            if hasattr(self, '_map'):
-                plots.append(self.point_plot(var1_id=var1_id, var2_id=var2_id, what_point='map'))
-        return hv.Overlay(plots).opts(legend_position='right', show_legend=True, fontsize=self._FONTSIZES)
-
-
-class MCMC_PLOT(PlotMonster):
-    def __init__(
-            self,
-            polytope: LabellingPolytope,  # this should be in the sampled basis!
-            inference_data: az.InferenceData,
-            v_rep: pd.DataFrame = None,
-            hv_backend='bokeh',
-    ):
-        super().__init__(polytope, inference_data, v_rep, hv_backend)
-        self._map = self._load_MAP()
-
-    def _load_MAP(self):
+    def _load_max_prob_point(self):
         if 'sample_stats' not in self._data:
             return
         lp = self._data.sample_stats.lp.values
@@ -447,18 +410,65 @@ class MCMC_PLOT(PlotMonster):
             result['data']=data
         return result
 
+    def grand_data_plot(self, var_names: Iterable, plot_map=True):
+        plots = []
+        cols = 3
+        for i, var_id in enumerate(var_names):
+            show_legend = True if i == cols - 1 else False
+            postpred = self.density_plot(var_id, group='posterior_predictive')
+            priopred = self.density_plot(var_id, group='prior_predictive')
+            true = self.point_plot(var_id, what_var='data', what_point='true')
+            width = 600 if i % cols == cols - 1 else 400
+            size_opts = self._size_opts(width=width)
+            layers = [postpred * priopred * true]
+            if plot_map:
+                map = self.point_plot(var_id, what_var='data', what_point='map')
+                layers = layers + [map]
+            panel = hv.Overlay(layers).opts(
+                legend_position='right', show_legend=show_legend, show_grid=True, fontsize=self._FONTSIZES,
+                ylabel='', **size_opts
+            )
+            plots.append(panel)
+
+        return hv.Layout(plots).cols(cols).opts(shared_axes=False)
+
+    def grand_theta_plot(self, var1_id, var2_id, group='posterior', bandwidth=None):
+        plots = [
+            self._plot_polytope_area(var1_id, var2_id),
+            self._data_hull(var1_id=var1_id, var2_id=var2_id, group=group),
+            self._bivariate_plot(var1_id=var1_id, var2_id=var2_id, group=group, bandwidth=bandwidth),
+        ]
+        if group == 'posterior':
+            if self._ttdf is not None:
+                plots.append(self.point_plot(var1_id=var1_id, var2_id=var2_id, what_point='true'))
+            if hasattr(self, '_map'):
+                plots.append(self.point_plot(var1_id=var1_id, var2_id=var2_id, what_point='map'))
+        return hv.Overlay(plots).opts(legend_position='right', show_legend=True, fontsize=self._FONTSIZES)
+
+
+class MCMC_PLOT(PlotMonster):
+    def __init__(
+            self,
+            fcm: FluxCoordinateMapper,  # this should be in the sampled basis!
+            inference_data: az.InferenceData,
+            v_rep: pd.DataFrame = None,
+            hv_backend='bokeh',
+    ):
+        self._max_prob_measure = 'lp'
+        super().__init__(fcm, inference_data, v_rep, hv_backend)
 
 
 class SMC_PLOT(PlotMonster):
 
     def __init__(
             self,
-            polytope: LabellingPolytope,  # this should be in the sampled basis!
+            fcm: FluxCoordinateMapper,  # this should be in the sampled basis!
             inference_data: az.InferenceData,
             v_rep: pd.DataFrame = None,
             hv_backend='bokeh',
     ):
-        super().__init__(polytope, inference_data, v_rep, hv_backend)
+        self._max_prob_measure = 'dist'
+        super().__init__(fcm, inference_data, v_rep, hv_backend)
 
     def plot_evolution(self, var1_id, var2_id=None, include_prior=True, include_fva=True):
         plots = []
@@ -481,7 +491,6 @@ class SMC_PLOT(PlotMonster):
                         muted = False
                         color = self._colors['posterior']
                         label = 'posterior'
-                        print(i)
                 plots.append(
                     self._plot_distribution(to_plot, var_id=xax, label=label, color=color, muted=muted)
                 )
@@ -522,7 +531,7 @@ def speed_plot():
     var2_id = 'B_svd3'
     group = 'posterior'
 
-    map = pm._load_MAP()
+    map = pm._load_max_prob_point()
     measurements = pm._load_observed_data()
     boli = measurements.columns.str.contains('[CD]\+', regex=True)
     plot = pm.grand_data_plot(measurements.columns[boli])
@@ -629,17 +638,76 @@ if __name__ == "__main__":
     import matplotlib
     import pickle
 
-    pol = pickle.load(open(r"C:\python_projects\sbmfi\pol.p", 'rb'))
-    v_rep = pd.read_excel(
-        'C:\python_projects\sbmfi\src\sbmfi\inference\VREP_MCMC_e_coli_glc_anton_obsmod_copy_NEWWP.xlsx')
-    smc_res = az.from_netcdf("C:/python_projects/sbmfi/SMC_e_coli_glc_tomek_obsmod_copy_NEW.nc")
-    smc_res = smc_res.sel(draw=slice(5000, None))
+    file = "C:\python_projects\sbmfi\mog_polytope_50k_samples.nc"
+    data = az.from_netcdf(file)
+    fcm = pickle.load(open(r"C:\python_projects\sbmfi\fcm.p", 'rb'))
 
-    smp = SMC_PLOT(pol, smc_res, v_rep=v_rep, hv_backend='bokeh')
+    plotter = MCMC_PLOT(fcm, data)
+    plott = plotter.grand_theta_plot('R_h_out', 'R_bm')
 
-    ding = smp.plot_evolution('R_svd0')
-    output_file(filename="custom_filename.html", title="plot1")
-    show(hv.render(ding))
+    output_file(filename="custom_filename1.html", title="plot1")
+    aaa = show(hv.render(plott), new='tab')
+
+    # model, kwargs = spiro(
+    #     backend='torch',
+    #     auto_diff=False,
+    #     batch_size=1,
+    #     add_biomass=True,
+    #     v2_reversible=True,
+    #     ratios=True,
+    #     build_simulator=True,
+    #     add_cofactors=True,
+    #     which_measurements=None,
+    #     seed=2,
+    #     measured_boundary_fluxes=('h_out',),
+    #     which_labellings=['A', 'B'],
+    #     include_bom=True,
+    #     v5_reversible=False,
+    #     n_obs=0,
+    #     kernel_id='svd',
+    #     L_12_omega=1.0,
+    #     clip_min=None,
+    #     transformation='ilr',
+    # )
+    # data = az.InferenceData.from_netcdf(file)
+    # fcm = model.flux_coordinate_mapper
+    # smc_plot = SMC_PLOT(
+    #     fcm=fcm,  # this should be in the sampled basis!
+    #     inference_data=data,
+    #     v_rep=None,
+    #     hv_backend='bokeh',
+    # )
+
+
+    # plott = smc_plot.plot_evolution('R_svd0',)
+    # plott = smc_plot.grand_data_plot(['A: ilr_C_0', 'A: ilr_C_1', 'A: ilr_D_0', 'A: ilr_D_1', 'A: ilr_H_0',
+    #    'A: ilr_L_0', 'A: ilr_L_1', 'A: ilr_L_2', 'A: ilr_L|[1,2]_0',
+    #    'B: ilr_C_0', 'B: ilr_D_0', 'B: ilr_H_{M+Cl}_0', 'B: ilr_H_0',
+    #    'B: ilr_L|[1,2]_0', 'BOM: h_out', 'BOM: bm'], plot_map=False)
+
+
+    # data_id = ['A: ilr_C_0', 'A: ilr_C_1', 'A: ilr_D_0', 'A: ilr_D_1', 'A: ilr_H_0',
+    #    'A: ilr_L_0', 'A: ilr_L_1', 'A: ilr_L_2', 'A: ilr_L|[1,2]_0',
+    #    'B: ilr_C_0', 'B: ilr_D_0', 'B: ilr_H_{M+Cl}_0', 'B: ilr_H_0',
+    #    'B: ilr_L|[1,2]_0', 'BOM: h_out', 'BOM: bm']
+    #
+    # ding = smc_plot.grand_data_plot(data_id, plot_map=True)
+    #
+    # # ding = smc_plot.plot_evolution('R_svd0', 'R_svd1')
+    # output_file(filename="custom_filename.html", title="plot1")
+    # show(hv.render(ding))
+
+    # pol = pickle.load(open(r"C:\python_projects\sbmfi\pol.p", 'rb'))
+    # v_rep = pd.read_excel(
+    #     'C:\python_projects\sbmfi\src\sbmfi\inference\VREP_MCMC_e_coli_glc_anton_obsmod_copy_NEWWP.xlsx')
+    # smc_res = az.from_netcdf("C:/python_projects/sbmfi/SMC_e_coli_glc_tomek_obsmod_copy_NEW.nc")
+    # smc_res = smc_res.sel(draw=slice(5000, None))
+    #
+    # smp = SMC_PLOT(pol, smc_res, v_rep=v_rep, hv_backend='bokeh')
+    #
+    # ding = smp.plot_evolution('R_svd0')
+    # output_file(filename="custom_filename.html", title="plot1")
+    # show(hv.render(ding))
 
     # var1 = ['[1]Glc: ilr_val__L_c_0', '[1]Glc: ilr_val__L_c_1', '20% [U]Glc: ilr_2pg_c_0']
     #

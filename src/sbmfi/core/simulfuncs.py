@@ -9,7 +9,7 @@ from sbmfi.core.observation import MDV_ObservationModel, MDV_LogRatioTransform
 def init_simulator(model: LabellingModel, epsilon=1e-12):
     global _MODEL, _EPSILON
     _MODEL = model
-    model.build_simulator(free_reaction_id=model.labelling_fluxes_id, verbose=False)  # necessary after pickling
+    model.build_model(free_reaction_id=model.labelling_fluxes_id)  # necessary after pickling
     _EPSILON = epsilon
 
 
@@ -35,7 +35,7 @@ def simulator_worker(task: dict, model=None) -> dict:
     la = MODEL._la
 
     if MODEL.labelling_id != input_labelling.name:
-        MODEL.set_input_labelling(input_labelling=input_labelling)
+        MODEL.set_substrate_labelling(substrate_labelling=input_labelling)
 
     mdv_chunk = la.get_tensor(  # by making this a tensor with -np.inf values, we can filter failed simulations
         values=np.full(shape=(fluxes_chunk.shape[0], n_state), fill_value=-np.inf, dtype=np.double)
@@ -61,7 +61,7 @@ def simulator_worker(task: dict, model=None) -> dict:
             i = j - step
         fluxes_batch = fluxes_chunk[i: j]
         try:
-            MODEL.set_fluxes(fluxes=fluxes_batch, trim=False)  # trim has to be False!
+            MODEL.set_fluxes(labelling_fluxes=fluxes_batch, trim=False)  # trim has to be False!
             mdv_chunk[i: j] = MODEL.cascade()
         except Exception as e:
             print(1, e)
@@ -72,7 +72,7 @@ def simulator_worker(task: dict, model=None) -> dict:
             except:
                 print(2, e)
             if type_jacobian == 'free':
-                jacobian_batch = MODEL._fcm.free_jacobian(jacobian_batch, fluxes=fluxes_batch)
+                jacobian_batch = MODEL._fcm.rounded_jacobian(jacobian_batch, fluxes=fluxes_batch)
             jacobian_chunk[i: j] = jacobian_batch
 
     # NB filter failed simulations (metabolite not summing to 1 or values outside of [0, 1]

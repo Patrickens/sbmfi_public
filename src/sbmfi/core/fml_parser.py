@@ -254,7 +254,7 @@ def pysumo_to_fml(
 
         # input labelling
         if input_labelling is None:
-            input_labelling = model.input_labelling
+            input_labelling = model.substrate_labelling
 
         for isocumo, frac in input_labelling.iteritems():
             met_id, label = isocumo.split('/')
@@ -356,7 +356,6 @@ def fml_to_sbml(fml_file):
 # NOTE: dont do fwd and reverse fluxes but rather do xch; this is advice from Beyss
 if __name__ == "__main__":
     from sbmfi.models.build_models import spiro, e_coli_glc, e_coli_succ, multi_modal
-    from sbmfi.tests.test_core.test_sumod import test_sens_question
     from sbmfi.settings import MODEL_DIR
     from sbmfi.core.observation import LCMS_ObservationModel
     import io, os

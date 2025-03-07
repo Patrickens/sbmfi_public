@@ -63,7 +63,7 @@ def parametrize(model):
     model.add_reactions(reaction_kwargs=reaction_kwargs)
     model.map_fluxes(fluxes=fluxes)
     model.set_ratio_repo(ratio_repo=ratio_repo)
-    model.set_input_labelling(input_labelling=input_labelling)
+    model.set_substrate_labelling(substrate_labelling=input_labelling)
     model.set_measurements(measurement_list=measured_metabolites, exclude=False)
     return model
 

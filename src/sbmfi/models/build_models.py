@@ -1,24 +1,29 @@
 import pandas as pd
 import numpy as np
-from collections import OrderedDict
 from sbmfi.core.model import LabellingModel, EMU_Model, RatioEMU_Model
 from sbmfi.core.observation import LCMS_ObservationModel, MVN_BoundaryObservationModel, ClassicalObservationModel, MDV_ObservationModel
 from sbmfi.core.reaction import LabellingReaction
 from sbmfi.core.linalg import LinAlg
-from sbmfi.core.util import make_multidex, excel_polytope
+from sbmfi.core.util import make_multidex
 from sbmfi.inference.bayesian import _BaseBayes
-from sbmfi.inference.priors import UniNetFluxPrior
-from sbmfi.settings import MODEL_DIR, SIM_DIR
-from sbmfi.lcmsanalysis.util import _strip_bigg_rex
-import sys, os
+from sbmfi.priors.uniform import UniformRoundedFleXchPrior
+from sbmfi.settings import MODEL_DIR
+from sbmfi.core.polytopia import transform_polytope_keep_transform, simplify_polytope
+from PolyRound.api import PolyRoundSettings
+import os
 import cobra
 from cobra.io import read_sbml_model
 from cobra import Reaction, Metabolite, DictList, Model
 # from pta import ConcentrationsPrior
 import pickle
+from sbmfi.core.polytopia import (
+    extract_labelling_polytope,
+    rref_null_space,
+    thermo_2_net_polytope
+)
+from sbmfi.core.coordinater import FluxCoordinateMapper
 from sbmfi.lcmsanalysis.formula import Formula, isotopologues
 from sbmfi.lcmsanalysis.util import build_correction_matrix
-from sbmfi.core.polytopia import FluxCoordinateMapper, extract_labelling_polytope, rref_null_space, thermo_2_net_polytope
 import cvxpy as cp
 from typing import Iterable
 import copy
@@ -1571,8 +1576,6 @@ def read_anton_substrates(which_labellings=None):
     return pd.read_csv(file, index_col=0).loc[which_labellings]
 
 
-from sbmfi.core.polytopia import transform_polytope_keep_transform, thermo_2_net_polytope
-from PolyRound.api import PolyRoundApi, PolyRoundSettings
 def _parse_anton_fluxes():
     v_map = {}
     for pway, vdct in _anton_model_kwargs.items():
@@ -1622,17 +1625,16 @@ def _parse_anton_fluxes():
     model, kwargs = build_e_coli_anton_glc(build_simulator=False)
     free_id = ['ME1', 'PGK', 'ICL', 'PGI', 'EDA', 'PPC', 'biomass_rxn', 'EX_glc__D_e', 'EX_ac_e']
     model.reactions.get_by_id('EX_glc__D_e').bounds = (-10.0, -10.0)
-    model.build_simulator(free_reaction_id=free_id, kernel_basis='rref', basis_coordinates='rounded')
-    thermo_pol = model._fcm._Ft
-    net_pol = model._fcm._Fn
+    model.build_model(free_reaction_id=free_id)
+    fcm = FluxCoordinateMapper(model, kernel_id='rref')
+    thermo_pol = extract_labelling_polytope(model, coordinate_id='thermo')
+    net_pol = thermo_2_net_polytope(thermo_pol)
     # pickle.dump(thermo_pol, open('tp.p', 'wb'))
 
     # thermo_pol = pickle.load(open('tp.p', 'rb'))
     # net_pol = thermo_2_net_polytope(thermo_pol, verbose=True)
-    simplified_net_pol = PolyRoundApi.simplify_polytope(
-        net_pol, settings=PolyRoundSettings(verbose=False), normalize=False
-    )
-    trans_pol, T, T_1, tau = transform_polytope_keep_transform(simplified_net_pol, kernel_basis='rref')
+    simplified_net_pol = simplify_polytope(net_pol, settings=PolyRoundSettings(verbose=False), normalize=False)
+    trans_pol, T, T_1, tau = transform_polytope_keep_transform(simplified_net_pol, kernel_id='rref')
     full_net_fluxes = T @ net_fluxes.loc[T.columns] + tau.values
 
     innnn = net_pol.A @ full_net_fluxes.loc[net_pol.A.columns]
@@ -2028,7 +2030,7 @@ def build_e_coli_anton_glc(
     thermo_fluxes, theta, comparison = None, None, None
     if annotation_df is not None:
         bom = MVN_BoundaryObservationModel(model, measured_boundary_fluxes, _bmid_ANTON)
-        up = UniNetFluxPrior(model)
+        up = UniformRoundedFleXchPrior(model)
         basebayes = _BaseBayes(model, substrate_df, obsmods, up, bom)
 
         thermo_fluxes = read_anton_fluxes()
@@ -2102,7 +2104,7 @@ def _parse_tomek_model():
 
     bm = core.reactions.get_by_id(_bmid_GAM)
     akg = core.metabolites.get_by_id('akg_c')
-    glu = core.metabolites.get_by_id('glu__L_c')
+    glu = core.metabolites.get_by_id('glu__L_c')  # biomass should not produce carbon containing molecules
     bm -= core.reactions.get_by_id('GLUDy') * bm.metabolites[akg]
     bm._metabolites[glu] = round(bm.metabolites[glu], 4)
 
@@ -2204,7 +2206,7 @@ def build_e_coli_tomek(
     model.reactions.get_by_id('FBP').bounds = (0.0, 0.0)
     model.reactions.get_by_id('SUCCt3').bounds = (0.0, 0.0)
     if build_simulator:
-        model.build_simulator()
+        model.build_model()
     return model, kwargs
 
 
@@ -2227,9 +2229,6 @@ def simulator_factory(
         ratios=True,
         seed=None,
         free_reaction_id=None,
-        kernel_basis='svd',
-        basis_coordinates='rounded',
-        logit_xch_fluxes=False,
 ) -> LabellingModel:
     if id_or_file_or_model is not None:
         try:
@@ -2264,22 +2263,15 @@ def simulator_factory(
         model.set_ratio_repo(ratio_repo=ratio_repo)
 
     if input_labelling is not None:
-        model.set_input_labelling(input_labelling=input_labelling)
+        model.set_substrate_labelling(substrate_labelling=input_labelling)
     if measurements is not None:
         model.set_measurements(measurement_list=measurements)
     if build_simulator:
-        model.build_simulator(
-            free_reaction_id=free_reaction_id,
-            kernel_basis=kernel_basis,
-            basis_coordinates=basis_coordinates,
-            logit_xch_fluxes=logit_xch_fluxes
-        )
+        model.build_model(free_reaction_id=free_reaction_id)
     return model
 
 
 if __name__ == "__main__":
-    import json
-
     pd.set_option('display.max_rows', 500)
     pd.set_option('display.max_columns', 500)
     pd.set_option('display.width', 1000)
@@ -2287,7 +2279,6 @@ if __name__ == "__main__":
 
     map_back = {}
     # from optlang.gurobi_interface import
-    from cobra.flux_analysis import flux_variability_analysis
 
     # model, kwargs = build_e_coli_anton_glc(backend='torch', build_simulator=True, which_measurements='tomek')
     model, kwargs = build_e_coli_anton_glc(backend='torch', build_simulator=False, which_measurements=None)

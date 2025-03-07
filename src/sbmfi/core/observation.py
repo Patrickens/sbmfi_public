@@ -3,23 +3,29 @@ import pandas as pd
 from typing import Iterable, Union, Dict, Tuple
 from itertools import product, cycle
 
-import scipy.linalg
+from scipy.linalg import helmert
 from cobra import Metabolite
 from sbmfi.core.linalg import LinAlg
 from sbmfi.core.model import LabellingModel, RatioMixin
 from sbmfi.core.metabolite import EMU
-from sbmfi.core.polytopia import FluxCoordinateMapper, rref_and_project, LabellingPolytope
+from sbmfi.core.coordinater import FluxCoordinateMapper
+from sbmfi.core.polytopia import (
+    project_polytope,
+    LabellingPolytope,
+    simplify_polytope
+)
 from sbmfi.core.util import (
-    _bigg_compartment_ids,
     make_multidex,
+    _bigg_compartment_ids
+)
+from sbmfi.lcmsanalysis.util import (
     build_correction_matrix,
     gen_annot_df,
-    _strip_bigg_rex,
+    _strip_bigg_rex
 )
 # from sbmfi.lcmsanalysis.zemzed import add_formulas
-from sbmfi.core.formula import Formula
-from sbmfi.core.adducts import emzed_adducts
-from PolyRound.api import PolyRoundApi
+from sbmfi.lcmsanalysis.formula import Formula
+from sbmfi.lcmsanalysis.adducts import emzed_adducts
 
 
 class MDV_ObservationModel(object):
@@ -322,7 +328,7 @@ class MDV_LogRatioTransform():
                 i, j = 0, 0
                 for ion_id, df in observation_df.groupby('ion_id', sort=False):
                     # basis = self._gramm_schmidt_basis(df.shape[0])
-                    basis = self._la.get_tensor(values=scipy.linalg.helmert(df.shape[0], full=False))
+                    basis = self._la.get_tensor(values=helmert(df.shape[0], full=False))
                     k, l = basis.shape
                     self._ilr_basis[j: j + l, i: i + k] = basis.T
                     self._sumatrix[j: j + l, j: j + l]  = 1.0
@@ -540,7 +546,7 @@ class _BlockDiagGaussian(object):
                 valid_cov = all(abs(offtri_cov) < corr_1)  # abs(correlation) <= 1
                 is_diagonal = self._la.allclose(sigma, self._la.transax(sigma), rtol=1e-10)  # sigma must be diagonal
                 if not (positive_var and valid_cov and is_diagonal):
-                    raise ValueError
+                    raise ValueError(f'positive variance: {positive_var}, diagional: {is_diagonal}, valid_cov: {valid_cov}')
 
         self._sigma = sigma
         self._chol = self._la.cholesky(self._sigma)  # NB fails if not invertible!
@@ -667,19 +673,11 @@ class ClassicalObservationModel(MDV_ObservationModel, _BlockDiagGaussian):
         mdv = self._la.atleast_2d(mdv)
         num = mdv[..., self._numi]
         denom = self._denom_sum @ num.T
-        if self._la._auto_diff:
-            return self._la.diff(inputs=mdv, outputs=num / denom[self._denomi])
         jac_num = self._num_sum @ num.T
         self._J_xs[:, self._mdv, self._col] = (jac_num / (denom ** 2)[self._denom]).T
         return self._J_xs
 
-    def J_xv(self, mdv, J_sv=None, fluxes=None):
-        if self._la._auto_diff:
-            if fluxes is None:
-                raise ValueError('fluxes are the ones that are used to generate the passed mdv')
-            observation = self.compute_observations(s=mdv, select=True)
-            # this assumes that mdv has been generated with the _fluxes currently set
-            return self._la.diff(inputs=fluxes, outputs=observation)
+    def J_xv(self, mdv, J_sv=None):
         J_xs = self.J_xs(mdv=mdv)
         return J_sv @ J_xs
 
@@ -767,6 +765,9 @@ class ClassicalObservationModel(MDV_ObservationModel, _BlockDiagGaussian):
         return noisy_observations
 
     def log_lik(self, x_meas, mu_o):
+        if self._cmin is not None:
+            raise ValueError('cannot compute log_lik for observation models with a clip_min, '
+                             'this would be a clipped Gaussian, which is not implemented here')
         x_meas = self._la.atleast_2d(x_meas)  # shape = n_meas x n_mdv
         mu_o = self._la.atleast_2d(mu_o)  # shape = batch x n_d
         diff = mu_o[:, None, :] - x_meas[:, None, :]  # shape = n_obs x batch x n_d
@@ -939,7 +940,6 @@ class BoundaryObservationModel(object):
             measured_boundary_fluxes: Iterable,
             biomass_id: str = None,  # 'bm', 'BIOMASS_Ecoli_core_w_GAM'
             check_noise_support: bool = False,
-            number_type='float',
     ):
         self._la = model._la
         self._call_kwargs = {}
@@ -961,13 +961,10 @@ class BoundaryObservationModel(object):
         if check_noise_support:
             pol = self._fcm._Fn
             settings = self._fcm._sampler._pr_settings
-            spol = PolyRoundApi.simplify_polytope(pol, settings=settings, normalize=False)
-            pol = LabellingPolytope.from_Polytope(spol, pol)
+            pol = simplify_polytope(pol, settings=settings, normalize=False)
             P = pd.DataFrame(0.0, index=self._bound_id, columns=pol.A.columns)
             P.loc[self._bound_id, self._bound_id] = np.eye(n)
-            self._boundary_pol = rref_and_project(
-                pol, P=P, number_type=number_type, settings=self._fcm._sampler._pr_settings
-            )
+            self._boundary_pol = project_polytope(pol, P)
             self._A = self._la.get_tensor(values=self._boundary_pol.A.values)
             self._b = self._la.get_tensor(values=self._boundary_pol.b.values)[:, None]
 
@@ -991,17 +988,16 @@ class BoundaryObservationModel(object):
 class MVN_BoundaryObservationModel(BoundaryObservationModel):
     def __init__(
             self,
-            fcm: FluxCoordinateMapper,
+            model: LabellingModel,
             measured_boundary_fluxes: Iterable,
             biomass_id: str = None,  # 'bm', 'BIOMASS_Ecoli_core_w_GAM'
             check_noise_support: bool = False,
-            number_type='float',
             sigma_o=None,
             biomass_std=0.1,
             boundary_std=0.3,
     ):
         super(MVN_BoundaryObservationModel, self).__init__(
-            fcm, measured_boundary_fluxes, biomass_id, check_noise_support, number_type
+            model, measured_boundary_fluxes, biomass_id, check_noise_support
         )
         n = len(self._bound_id)
         if sigma_o is None:
@@ -1090,10 +1086,7 @@ def exclude_low_massiso(
 
 if __name__ == "__main__":
     from sbmfi.models.small_models import spiro
-    from sbmfi.models.build_models import build_e_coli_anton_glc
     # from sbmfi.core.polytopia import coordinate_hit_and_run_cpp
-    import pickle
-    from sbmfi.inference.priors import UniNetFluxPrior
 
     import pandas as pd
 
@@ -1106,7 +1099,7 @@ if __name__ == "__main__":
     annotation_df = kwargs['annotation_df']
     fluxes = kwargs['fluxes']
     substrate_df = kwargs['substrate_df']
-    model.set_input_labelling(input_labelling=substrate_df.iloc[1])
+    model.set_substrate_labelling(substrate_labelling=substrate_df.iloc[1])
 
     # observation_df = LCMS_ObservationModel.generate_observation_df(model, annotation_df)
     # com = ClassicalObservationModel(model, kwargs['annotation_df'])
